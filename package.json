@@ -1,0 +1,16 @@
+{
+  "name": "totalrecall",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test"
+  },
+  "cmod": {
+    "program": "totalrecall",
+    "install": "./setup/install.sh",
+    "uninstall": "./setup/uninstall.sh"
+  },
+  "dependencies": {
+    "@cmodjs/core": "^5.0.0"
+  }
+}
