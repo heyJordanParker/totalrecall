@@ -1,0 +1,21 @@
+{
+  "name": "totalrecall",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test"
+  },
+  "cmod": {
+    "program": "totalrecall",
+    "install": "./setup/install.sh",
+    "uninstall": "./setup/uninstall.sh",
+    "permissions": {
+      "network": ["127.0.0.1"],
+      "run": ["hostname"],
+      "prompt": true
+    }
+  },
+  "dependencies": {
+    "@cmodjs/core": "^4.3.0"
+  }
+}

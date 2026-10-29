@@ -1,0 +1,18 @@
+{
+  "name": "totalrecall",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "for machine in ${CMOD_MACHINES:-darwin-arm64 darwin-x64 linux-arm64 linux-x64}; do bun build --compile --minify --target=bun-$machine src/main.ts --outfile dist/totalrecall-$machine || exit 1; done",
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "cmod": {
+    "build": "bun run build",
+    "output": "dist"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}

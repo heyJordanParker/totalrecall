@@ -1,0 +1,6 @@
+{
+  "description": "totalrecall hooks module",
+  "modules": [
+    "./register.ts"
+  ]
+}
