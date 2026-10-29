@@ -199,6 +199,20 @@ test('a tool result logs without the reminders Claude Code adds to it', async ()
   expect(chat.message(2).text).toBe('a.txt')
 })
 
+test('a tool output over 30,000 characters logs as one message holding its head and tail', async () => {
+  const { filter, chat } = setup()
+  const call = { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'cat big.log' } }] }
+  const output = `HEAD${'x'.repeat(50_000)}TAIL`
+  const result = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: output }] }
+  await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([OPENING, call, result]) })
+  const logged = chat.message(2).text
+  expect(chat.total).toBe(3)
+  expect(logged.length).toBe(30_000)
+  expect(logged).toStartWith('HEAD')
+  expect(logged).toEndWith('TAIL')
+  expect(logged).toContain('[… 20036 characters cut …]')
+})
+
 test('words the person sends while Claude works log as theirs, without Claude Code’s wrapper', async () => {
   const { filter, chat } = setup()
   const call = { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] }
@@ -301,6 +315,32 @@ test('a long message waits for its summary before the next turn reads the view',
   expect(chat.text({ l: 0, i: 0 })).toBe('user: asked for a long thing')
 })
 
+test('a summary that failed is tried again as the next turn starts, so the turn never waits it out', async () => {
+  const folder = mkdtempSync(join(tmpdir(), 'totalrecall-'))
+  folders.push(folder)
+  let isFailing = true
+  const send = (async () => (isFailing ? new Response('overloaded', { status: 529 }) : sse('user: asked for a long thing'))) as unknown as typeof fetch
+  const chat = new Chat(folder)
+  const compactor = new Compactor(chat, new Pool('http://pool', send), 'totalrecall-compaction')
+  chat.listen(compactor)
+  const filter = new Filter(chat, compactor, new Sessions(join(folder, 'sessions')), 5_000)
+  const long = { role: 'user', content: [{ type: 'text', text: 'x'.repeat(2_000) }] }
+  await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([long]) })
+  await Bun.sleep(50)
+  expect(chat.text({ l: 0, i: 0 })).toBeUndefined()
+  isFailing = false
+  const started = Date.now()
+  const answer = await filter.request(DEVICE, {
+    id: 'r2',
+    path: '/v1/messages',
+    headers: HEADERS,
+    body: body([long, { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, { role: 'user', content: [{ type: 'text', text: 'next' }] }]),
+  })
+  expect(Date.now() - started).toBeLessThan(1_000)
+  const opening = (answer.body as { messages: { content: Block[] }[] }).messages[0]!.content
+  expect(opening[0]!['text']).toBe('<chat>\n0+1|user: asked for a long thing\n1+1|claude: ok\n</chat>')
+})
+
 test('a session that turns recall on runs as plain Claude Code until its history is summarized, then reads the chat', async () => {
   const { filter, chat } = setup(['user: asked for a long thing'])
   const long = { role: 'user', content: [{ type: 'text', text: 'x'.repeat(2_000) }] }
@@ -356,7 +396,7 @@ test('a compaction reads the same system prompt, tools, and instructions as the 
   expect(compaction.tools).toEqual(sent.tools)
   expect(compaction.messages.length).toBe(1)
   expect(compaction.messages[0]!.content.slice(0, 2)).toEqual(sent.messages[0]!.content.slice(0, 2))
-  expect(compaction.messages[0]!.content.slice(2).map((block) => String(block['text']).slice(0, 40))).toEqual(['<chat>\n</chat>', 'Compaction: compress message 0 into one ', '</input>'])
+  expect(compaction.messages[0]!.content.slice(2).map((block) => String(block['text']).slice(0, 40))).toEqual(['<chat>\n</chat>', 'Compaction: compress message 0 into one ', '\n</input>'])
   expectValidRoles(compaction.messages)
 })
 
@@ -371,7 +411,7 @@ test('a picture in a tool result is kept with its message, and its summary is wr
   const task = calls[0]!.body.messages[0]!.content.slice(-3)
   expect(String(task[0]!['text'])).toEndWith('<input>\necho: [image]')
   expect(task[1]).toEqual(picture)
-  expect(task[2]).toMatchObject({ type: 'text', text: '</input>' })
+  expect(task[2]).toMatchObject({ type: 'text', text: '\n</input>' })
   expect(chat.text({ l: 0, i: 2 })).toBe('echo: a login page with an empty password field')
 })
 

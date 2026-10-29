@@ -41,6 +41,17 @@ test('a restarted server queues every node it still has to build', () => {
   expect(ready).toEqual([{ l: 0, i: 1 }])
 })
 
+test('a restarted server queues a merge whose halves are both built once', () => {
+  const { folder, chat } = open()
+  chat.log('user', 'x'.repeat(600))
+  chat.log('user', 'y'.repeat(600))
+  chat.build({ l: 0, i: 0 }, 'z'.repeat(300))
+  chat.build({ l: 0, i: 1 }, 'w'.repeat(300))
+  const ready: Line[] = []
+  new Chat(folder).listen({ ready: (line) => void ready.push(line) })
+  expect(ready).toEqual([{ l: 1, i: 0 }])
+})
+
 test('a short message is its own node, and two short lines merge without a model', () => {
   const { chat, ready } = open()
   chat.log('user', 'hello')

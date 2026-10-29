@@ -214,11 +214,11 @@ export class Filter {
     }
     this.joining.delete(history)
     this.passing.delete(history)
+    this.compactor.retryFailed()
     await Promise.race([this.compactor.whenSummarized(this.chat.total), Bun.sleep(this.waitMs)])
     const view = this.renderView()
     this.turnViews.set(history, view)
     this.logFrom(history, isMain, all, turnFrom)
-    this.compactor.retryFailed()
     return view
   }
 

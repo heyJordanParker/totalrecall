@@ -121,7 +121,7 @@ export class Chat implements Lines {
     }
     for (const built of [...this.nodes.keys()]) {
       const [l, i] = built.split(':').map(Number) as [number, number]
-      this.offerParent({ l, i })
+      if (i % 2 === 0) this.offerParent({ l, i })
     }
   }
 
@@ -202,7 +202,13 @@ export class Chat implements Lines {
 
   logAgent(id: string, kind: Kind, text: string, images: readonly Image[] = [], now = new Date()): void {
     const record = { kind, text, date: now.toISOString(), ...(images.length > 0 ? { images } : {}) }
-    writeFileSync(join(this.agents, `${encodeURIComponent(id)}.jsonl`), `${JSON.stringify(record)}\n`, { flag: 'a' })
+    const fd = openSync(join(this.agents, `${encodeURIComponent(id)}.jsonl`), 'a')
+    try {
+      writeSync(fd, `${JSON.stringify(record)}\n`)
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
   }
 
   nameAgent(id: string, task: string): string {

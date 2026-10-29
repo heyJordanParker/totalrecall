@@ -51,7 +51,7 @@ for one (no sleep, no polling): go on, or end your turn and tell the user what
 is running.
 
 The user works on several computers, and the chat holds the work of all of
-them. Each message starts with the computer and folder this session runs on, as
+them. Each turn starts with the computer and folder this session runs on, as
 "device: <computer>:<folder>". Your tools run there and nowhere else. Each tool
 call in the chat names the computer and folder it ran on in its "device" field,
 so a file or command from another device is not reachable from here: tell the
@@ -100,7 +100,7 @@ export const compressTask = (id: number, kind: Kind, text: string): [string, str
 ${RULER}
 <input>
 ${kind}: ${text}`,
-  '</input>',
+  '\n</input>',
 ]
 
 export const mergeTask = (a: string, b: string, lineA: string, lineB: string, firstId: number, lastId: number): string => `Compaction: merge lines ${a} and ${b}, adjacent, into one line of at most

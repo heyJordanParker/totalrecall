@@ -64,10 +64,13 @@ const typedCommand = (blocks: readonly Block[]): string | undefined => {
   return undefined
 }
 
+const cutMarker = (cut: number): string => `\n[… ${cut} characters cut …]\n`
+
 export const clip = (text: string): string => {
   if (text.length <= TOOL_OUTPUT_CHARACTERS) return text
-  const half = TOOL_OUTPUT_CHARACTERS / 2
-  return `${text.slice(0, half)}\n[… ${text.length - TOOL_OUTPUT_CHARACTERS} characters cut …]\n${text.slice(-half)}`
+  const kept = TOOL_OUTPUT_CHARACTERS - cutMarker(text.length).length
+  const head = Math.ceil(kept / 2)
+  return `${text.slice(0, head)}${cutMarker(text.length - kept)}${text.slice(text.length - (kept - head))}`
 }
 
 const resultText = (block: Block): string => {

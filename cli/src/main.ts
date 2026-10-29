@@ -21,13 +21,21 @@ const isRunning = (pid: number): boolean => {
   }
 }
 
+const claim = (path: string): void => {
+  writeFileSync(path, String(process.pid), { flag: 'wx' })
+}
+
 const lock = (folder: string): void => {
   const path = join(folder, 'chat.lock')
-  if (existsSync(path)) {
+  try {
+    claim(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
     const holder = Number(readFileSync(path, 'utf8'))
-    if (holder !== process.pid && isRunning(holder)) throw new Error(`Another totalrecall (pid ${holder}) owns the chat in ${folder}.`)
+    if (isRunning(holder)) throw new Error(`Another totalrecall (pid ${holder}) owns the chat in ${folder}.`)
+    unlinkSync(path)
+    claim(path)
   }
-  writeFileSync(path, String(process.pid))
   process.on('exit', () => {
     if (existsSync(path) && Number(readFileSync(path, 'utf8')) === process.pid) unlinkSync(path)
   })
