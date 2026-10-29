@@ -1,0 +1,36 @@
+{
+  "name": "totalrecall",
+  "owner": {
+    "name": "heyJordanParker"
+  },
+  "description": "Claude remembers everything: every session you turn it on in shares one chat that never ends.",
+  "plugins": [
+    {
+      "name": "totalrecall",
+      "description": "Claude remembers everything: every session you turn it on in shares one chat that never ends.",
+      "source": {
+        "source": "archive",
+        "url": "https://github.com/heyJordanParker/totalrecall/releases/download/v0.1.0/totalrecall-0.1.0.zip",
+        "sha256": "9175497b0ccfaf40952ab9a40d70ba2860ea7a572b08dc5a497c483e96e8a26b"
+      }
+    },
+    {
+      "name": "cmod",
+      "description": "Claude Mod Manager: runs the uninstall step of each mod Claude Code removes",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/heyJordanParker/cmod.git",
+        "ref": "release"
+      }
+    },
+    {
+      "name": "oneclaude",
+      "description": "Every Claude subscription you have, as one pool: routing, usage, pace and agents under the prompt",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/heyJordanParker/oneclaude.git",
+        "ref": "release"
+      }
+    }
+  ]
+}
