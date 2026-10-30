@@ -3,6 +3,8 @@ import { Prompt } from '../node_modules/@cmodjs/core/mod.js'
 import { testMod } from '../node_modules/@cmodjs/core/testing.js'
 import { totalrecall } from '../src/mod.js'
 
+const VIEW = '<chat>\n0+1|user: hello\n</chat>'
+
 const setup = (options: { pool?: string; isServing?: boolean } = {}) => {
   const filters: { method: string; input: object }[] = []
   const posted: string[] = []
@@ -25,7 +27,7 @@ const setup = (options: { pool?: string; isServing?: boolean } = {}) => {
     posted.push(url)
     if (options.isServing === false) throw new Error('connection refused')
     const path = new URL(url).pathname
-    const answer = path === '/zoom' ? { content: [{ type: 'text', text: '0+1|user: hello' }] } : { text: 'Friday' }
+    const answer = path === '/zoom' ? { content: [{ type: 'text', text: '0+1|user: hello' }] } : path === '/view' ? { text: VIEW } : { text: 'Friday' }
     return { status: 200, ok: true, headers: {}, text: JSON.stringify(answer) }
   }) as never
   return { tested, filters, posted, ran }
@@ -71,16 +73,19 @@ test('a session that never turned it on stays out of the filter', async () => {
   expect(filters.map(({ method }) => method)).toEqual(['removeFilter', 'removeFilter'])
 })
 
-test('a recall session refuses a compaction only while its program does not answer', async () => {
-  const down = setup({ isServing: false })
-  await down.tested.add({ type: Prompt, text: 'hello' })
-  expect(await down.tested.raise.beforeContextEnd()).toBeUndefined()
-  await down.tested.type('/recall')
-  expect(await down.tested.raise.beforeContextEnd()).toMatchObject({ refuse: expect.stringContaining('can\'t reach its program') })
-  const up = setup()
-  await up.tested.add({ type: Prompt, text: 'hello' })
-  await up.tested.type('/recall')
-  expect(await up.tested.raise.beforeContextEnd()).toBeUndefined()
+test('a recall session’s compaction starts the new context from the chat’s view, and no model runs', async () => {
+  const { tested } = setup()
+  await tested.add({ type: Prompt, text: 'hello' })
+  expect(await tested.raise.beforeContextEnd()).toBeUndefined()
+  await tested.type('/recall')
+  expect(await tested.raise.beforeContextEnd()).toEqual({ summary: VIEW })
+})
+
+test('a recall session refuses a compaction while its program does not answer', async () => {
+  const { tested } = setup({ isServing: false })
+  await tested.add({ type: Prompt, text: 'hello' })
+  await tested.type('/recall')
+  expect(await tested.raise.beforeContextEnd()).toMatchObject({ refuse: expect.stringContaining('can\'t reach its program') })
 })
 
 test('a recall session compacts Claude Code’s own copy once it passes 80% of the window', async () => {

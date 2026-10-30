@@ -11,6 +11,6 @@
     "uninstall": "./setup/uninstall.sh"
   },
   "dependencies": {
-    "@cmodjs/core": "^5.0.0"
+    "@cmodjs/core": "^5.1.0"
   }
 }

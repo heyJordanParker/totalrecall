@@ -1,6 +1,6 @@
 {
   "name": "totalrecall",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude remembers everything: every session you turn it on in shares one chat that never ends.",
   "author": {
     "name": "Jordan Parker",
@@ -10,7 +10,7 @@
   "dependencies": [
     {
       "name": "cmod",
-      "version": ">=5.0.0"
+      "version": ">=5.1.0"
     },
     {
       "name": "oneclaude",
