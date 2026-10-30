@@ -2,10 +2,9 @@ import type { Chat } from './chat.ts'
 import type { Compactor } from './compactor.ts'
 import { blocksOf, isCompaction, isContext, itemsOf, turnStart, type ApiMessage, type Item } from './history.ts'
 import { Accumulator, type Block, type StreamEvent } from './pool.ts'
-import { SYSTEM } from './prompt.ts'
+import { SUBAGENT, SYSTEM } from './prompt.ts'
 import { chatBlocks, mark, type Place } from './render.ts'
 import type { Sessions } from './sessions.ts'
-import { render } from './view.ts'
 
 export const PLUGIN = 'totalrecall'
 export const OWN_TOOLS = { zoom: `mcp__${PLUGIN}__zoom`, date: `mcp__${PLUGIN}__date` } as const
@@ -36,11 +35,11 @@ const isOwnAddition = (block: Block): boolean => {
   return isOwn(tool?.definition?.['name'] ?? tool?.name)
 }
 
-const withPrompt = (system: string | Block[] | undefined): Block[] => {
+const withPrompt = (system: string | Block[] | undefined, prompt: string): Block[] => {
   const blocks = (typeof system === 'string' ? [{ type: 'text', text: system }] : (system ?? [])).map(unmarked)
   const opening = blocks.findIndex((block) => /^You are (Claude Code|a Claude agent)/.test(String(block['text'] ?? '')))
   const at = opening !== -1 ? opening + 1 : blocks.findIndex((block) => String(block['text'] ?? '').startsWith('x-anthropic-billing-header')) + 1
-  return [...blocks.slice(0, at), { type: 'text', text: SYSTEM }, ...blocks.slice(at)]
+  return [...blocks.slice(0, at), { type: 'text', text: prompt }, ...blocks.slice(at)]
 }
 
 const loadedTools = (block: Block): Block[] => {
@@ -78,6 +77,7 @@ export class Filter {
     private readonly chat: Chat,
     private readonly compactor: Compactor,
     private readonly sessions: Sessions,
+    private readonly wasImported: (session: string) => boolean = () => false,
     private readonly waitMs = 100_000,
   ) {}
 
@@ -95,15 +95,14 @@ export class Filter {
     }
     if (!Array.isArray(request.tools) || request.tools.length === 0) return {}
     if (path === COUNT_TOKENS) {
-      return this.passing.has(history) ? {} : { body: this.rewrite(request, this.turnViews.get(history) ?? this.renderView(), isMain, device) }
+      return this.passing.has(history) ? {} : { body: this.rewrite(request, this.turnViews.get(history) ?? this.chat.rendered(), isMain, device) }
     }
     if (path !== MESSAGES) return {}
     if (isMain) {
       const instructions = instructionsOf(request.messages)
       this.compactor.useTemplate({
         headers,
-        system: withPrompt(request.system),
-        tools: toolsOf(request),
+        system: withPrompt(request.system, SYSTEM),
         instructions: instructions.length === 0 ? [] : [{ role: 'user', content: instructions }],
         metadata: request.metadata,
       })
@@ -140,10 +139,6 @@ export class Filter {
     return changed ? { body: { ...request, ...(tools === undefined ? {} : { tools }), messages } } : {}
   }
 
-  private renderView(): string[] {
-    return this.chat.view.lines.map((line) => render(line, this.chat))
-  }
-
   private log(history: string, isMain: boolean, item: Item): void {
     if (isMain) this.chat.log(item.kind, item.text, item.images)
     else this.chat.logAgent(history.split('/')[1]!, item.kind, item.text, item.images)
@@ -176,7 +171,6 @@ export class Filter {
     if (items.length === 0) return
     for (const item of items) this.log(pending.history, pending.isMain, item)
     this.sessions.keep(pending.history, items.map((item) => item.key), this.sessions.keys(pending.history).length)
-    if (pending.isMain) this.compactor.retryFailed()
   }
 
   private async ingest(history: string, isMain: boolean, device: string, messages: ApiMessage[]): Promise<string[] | undefined> {
@@ -188,9 +182,8 @@ export class Filter {
     const isFirstRequest = !messages.slice(start + 1).some((message) => message.role === 'assistant')
     if (!isFirstRequest || !isMain) {
       this.logFrom(history, isMain, all, same)
-      if (same < all.length && isMain) this.compactor.retryFailed()
       if (this.passing.has(history)) return undefined
-      if (!this.turnViews.has(history)) this.turnViews.set(history, this.renderView())
+      if (!this.turnViews.has(history)) this.turnViews.set(history, this.chat.rendered())
       return this.turnViews.get(history)!
     }
     const known = this.turnViews.get(history)
@@ -199,7 +192,9 @@ export class Filter {
       return this.passing.has(history) ? undefined : known
     }
     const logged = Math.min(same, before.length)
-    if (logged < before.length) {
+    if (logged < before.length && this.wasImported(history)) {
+      this.sessions.keep(history, before.slice(logged).map((item) => item.key), logged)
+    } else if (logged < before.length) {
       const from = this.chat.total
       this.logFrom(history, isMain, before, logged)
       this.joining.set(history, { from, to: this.chat.total })
@@ -214,9 +209,8 @@ export class Filter {
     }
     this.joining.delete(history)
     this.passing.delete(history)
-    this.compactor.retryFailed()
     await Promise.race([this.compactor.whenSummarized(this.chat.total), Bun.sleep(this.waitMs)])
-    const view = this.renderView()
+    const view = this.chat.rendered()
     this.turnViews.set(history, view)
     this.logFrom(history, isMain, all, turnFrom)
     return view
@@ -248,6 +242,6 @@ export class Filter {
       if (previous.role === message.role && message.role !== 'assistant') previous.content.push(...blocksOf(message))
       else out.push({ role: message.role, content: [...blocksOf(message)] })
     }
-    return { ...request, system: withPrompt(request.system), tools: toolsOf(request), messages: mark(out, places) }
+    return { ...request, system: withPrompt(request.system, isMain ? SYSTEM : SUBAGENT), tools: toolsOf(request), messages: mark(out, places) }
   }
 }

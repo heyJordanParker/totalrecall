@@ -1,39 +1,53 @@
 import { LINE_BYTES, type Chat, type ChatEvents } from './chat.ts'
 import { imageBlock } from './history.ts'
-import { textOf, type Block, type Pool } from './pool.ts'
-import { compressTask, mergeTask, tooLong } from './prompt.ts'
+import { PoolError, textOf, type Block, type Pool, type Reply } from './pool.ts'
+import { compressTask, headBytes, mergeTask, tooLong } from './prompt.ts'
 import { chatBlocks, mark, type Place } from './render.ts'
-import { children, end, first, name, render, type Line } from './view.ts'
+import { children, COMPACTION, end, first, flat, name, render, slot, type Line } from './view.ts'
 
 export type Template = {
   readonly headers: Readonly<Record<string, string>>
   readonly system: readonly Block[]
-  readonly tools: readonly object[]
   readonly instructions: readonly { role: string; content: Block[] }[]
   readonly metadata?: unknown
 }
 
 export const COMPACTION_MODEL = 'claude-haiku-5-5'
-const AT_ONCE = 8
+export const AT_ONCE = 64
 const TRIES = 5
+const LONGEST_WAIT_MS = 60_000
 const DROPPED_HEADERS = new Set(['content-length', 'host', 'connection', 'accept-encoding', 'x-claude-code-agent-id', 'x-claude-code-agent-type'])
 
+type Side = 0 | 1
 type Waiter = { readonly before: number; readonly resolve: () => void }
 
+const ctx = ({ l, i }: Line): number => (l === 0 ? i : (i + 1) * 2 ** l)
+
+const insert = (sorted: number[], id: number): void => {
+  let low = 0
+  let high = sorted.length
+  while (low < high) {
+    const middle = (low + high) >> 1
+    if (sorted[middle]! < id) low = middle + 1
+    else high = middle
+  }
+  if (sorted[low] !== id) sorted.splice(low, 0, id)
+}
+
 export class Compactor implements ChatEvents {
-  private readonly messages: number[] = []
-  private readonly merges: Line[] = []
-  private readonly unbuilt = new Set<number>()
-  private readonly failed: Line[] = []
+  private readonly queues: [number[][], number[][]] = [[], []]
+  private readonly running = new Map<number, Side>()
   private readonly waiters: Waiter[] = []
   private readonly writing = new Map<string, Promise<void>>()
-  private running = 0
   private template: Template | undefined
+  private isPumping = false
+  private isPumpedAgain = false
 
   constructor(
     private readonly chat: Chat,
     private readonly pool: Pool,
     private readonly sessionId: string,
+    private readonly wait: (ms: number) => Promise<unknown> = (ms) => Bun.sleep(ms),
   ) {}
 
   useTemplate(template: Template): void {
@@ -43,123 +57,155 @@ export class Compactor implements ChatEvents {
   }
 
   ready(line: Line): void {
-    if (line.l === 0) {
-      this.unbuilt.add(line.i)
-      const at = this.messages.findIndex((id) => id > line.i)
-      this.messages.splice(at === -1 ? this.messages.length : at, 0, line.i)
-    } else {
-      this.merges.push(line)
-    }
+    insert((this.queues[this.chat.lineSide(line)][line.l] ??= []), line.i)
     this.pump()
   }
 
-  retryFailed(): void {
-    for (const line of this.failed.splice(0)) this.ready(line)
+  changed(): void {
+    for (const waiter of this.waiters.splice(0)) {
+      if (this.chat.unbuiltAt(0, 0) >= waiter.before) waiter.resolve()
+      else this.waiters.push(waiter)
+    }
   }
 
   isSummarized(from: number, to: number): boolean {
-    return ![...this.unbuilt].some((id) => id >= from && id < to)
+    return !this.chat.hasUnbuilt(0, from, to)
   }
 
   whenSummarized(before: number): Promise<void> {
-    if (![...this.unbuilt].some((id) => id < before)) return Promise.resolve()
+    if (this.chat.unbuiltAt(0, 0) >= before) return Promise.resolve()
     return new Promise((resolve) => this.waiters.push({ before, resolve }))
   }
 
-  private unbuiltBefore(id: number): number {
+  private runningOn(side: Side): number {
     let found = 0
-    for (const other of this.unbuilt) if (other < id) found += 1
+    for (const each of this.running.values()) if (each === side) found += 1
     return found
   }
 
-  private next(): Line | undefined {
-    const message = this.messages[0]
-    if (message !== undefined && this.unbuiltBefore(message) < AT_ONCE) {
-      this.messages.shift()
-      return { l: 0, i: message }
-    }
-    return this.merges.shift()
+  private starts(side: Side): Line[] {
+    const reach = this.chat.unbuiltAt(side, AT_ONCE - 1)
+    const lines: Line[] = []
+    this.queues[side].forEach((queue, l) => {
+      for (let k = 0; k < queue.length && ctx({ l, i: queue[k]! }) <= reach; k += 1) lines.push({ l, i: queue[k]! })
+    })
+    return lines.sort((a, b) => ctx(a) - ctx(b) || b.l - a.l)
   }
 
   private pump(): void {
     if (this.template === undefined) return
-    while (this.running < AT_ONCE) {
-      const line = this.next()
-      if (line === undefined) return
-      this.running += 1
-      this.compact(line, this.template)
-        .catch((error: unknown) => {
-          console.error(`totalrecall: compaction of ${name(line)} failed: ${error instanceof Error ? error.message : String(error)}`)
-          this.failed.push(line)
-        })
-        .finally(() => {
-          this.running -= 1
-          this.pump()
-        })
+    if (this.isPumping) {
+      this.isPumpedAgain = true
+      return
+    }
+    this.isPumping = true
+    try {
+      do {
+        this.isPumpedAgain = false
+        for (const side of [0, 1] as const) {
+          for (const line of this.starts(side)) {
+            if (this.runningOn(side) >= AT_ONCE) break
+            const queue = this.queues[side][line.l]!
+            const at = queue.indexOf(line.i)
+            if (at === -1) continue
+            queue.splice(at, 1)
+            if (this.running.has(slot(line)) || this.chat.isBuilt(line)) continue
+            const source = this.chat.source(line)
+            const isPictured = line.l === 0 && this.chat.message(line.i).images !== undefined
+            if (Buffer.byteLength(source) <= LINE_BYTES && !isPictured) this.chat.build(line, source)
+            else this.run(line, side, this.template)
+          }
+        }
+      } while (this.isPumpedAgain)
+    } finally {
+      this.isPumping = false
     }
   }
 
-  private built(line: Line, text: string): void {
-    this.chat.build(line, text)
-    if (line.l !== 0) return
-    this.unbuilt.delete(line.i)
-    for (const waiter of this.waiters.splice(0)) {
-      if ([...this.unbuilt].some((id) => id < waiter.before)) this.waiters.push(waiter)
-      else waiter.resolve()
-    }
+  private run(line: Line, side: Side, template: Template): void {
+    this.running.set(slot(line), side)
+    this.compact(line, template)
+      .catch(async (error: unknown) => {
+        console.error(`totalrecall: compaction of ${name(line)} failed: ${error instanceof Error ? error.message : String(error)}`)
+        await this.wait(LONGEST_WAIT_MS)
+        insert((this.queues[side][line.l] ??= []), line.i)
+      })
+      .finally(() => {
+        this.running.delete(slot(line))
+        this.pump()
+      })
   }
 
   private context(line: Line): Line[] {
-    const boundary = line.l === 0 ? first(line) : end(line)
-    const lines: Line[] = []
-    for (const candidate of this.chat.compactionView.lines) {
-      if (end(candidate) > boundary || !this.chat.isBuilt(candidate)) break
-      lines.push(candidate)
-    }
-    return lines
+    const upto = Math.min(ctx(line), this.chat.unbuiltAt(this.chat.lineSide(line), 0))
+    const lines = this.chat.compactionView.lines.filter((each) => end(each) <= upto && this.chat.isBuilt(each))
+    let size = 0
+    let from = lines.length
+    while (from > 0 && size + this.chat.size(lines[from - 1]!) <= COMPACTION.high) size += this.chat.size(lines[--from]!)
+    return lines.slice(from)
   }
 
-  private task(line: Line): Block[] {
+  private task(line: Line, source: string): Block[] {
     if (line.l === 0) {
-      const message = this.chat.message(line.i)
-      const [input, close] = compressTask(line.i, message.kind, message.text)
-      return [{ type: 'text', text: input }, ...(message.images ?? []).map(imageBlock), { type: 'text', text: close }]
+      const [input, close] = compressTask(line.i, source)
+      return [{ type: 'text', text: input }, ...(this.chat.message(line.i).images ?? []).map(imageBlock), { type: 'text', text: close }]
     }
     const [a, b] = children(line)
-    return [{ type: 'text', text: mergeTask(name(a), name(b), render(a, this.chat), render(b, this.chat), first(line), end(line) - 1) }]
+    return [{ type: 'text', text: mergeTask(name(a), name(b), source, first(line), end(line) - 1) }]
   }
 
   private async compact(line: Line, template: Template): Promise<void> {
+    const source = this.chat.source(line)
     const view = chatBlocks(this.context(line).map((each) => render(each, this.chat)))
     const messages = template.instructions.map((message) => ({ role: message.role, content: [...message.content] }))
     const places: Place[] = messages.length === 0 ? [] : [{ message: messages.length - 1, block: messages.at(-1)!.content.length - 1 }]
     const into = messages.at(-1)?.role === 'user' ? messages.at(-1)! : messages[messages.push({ role: 'user', content: [] }) - 1]!
     if (view.marked >= 0) places.push({ message: messages.indexOf(into), block: into.content.length + view.marked })
-    into.content.push(...view.blocks, ...this.task(line))
+    into.content.push(...view.blocks, ...this.task(line, source))
     const headers = Object.fromEntries(Object.entries(template.headers).filter(([header]) => !DROPPED_HEADERS.has(header)))
-    const prefix = String(Bun.hash(JSON.stringify([template.system, template.tools, template.instructions, view.blocks.slice(0, view.marked + 1)])))
-    let best: string | undefined
-    for (let attempt = 0; attempt < TRIES; attempt += 1) {
+    const prefix = String(Bun.hash(JSON.stringify([template.system, template.instructions, view.blocks.slice(0, view.marked + 1)])))
+    const lines: string[] = []
+    for (let note: Block[] = []; lines.length < TRIES; ) {
+      const asked = messages.map((message) => (message === into ? { ...message, content: [...message.content, ...note] } : message))
       const body = {
         model: COMPACTION_MODEL,
         max_tokens: 32_000,
         system: template.system,
-        tools: template.tools,
         thinking: { type: 'adaptive' },
-        output_config: { effort: 'xhigh' },
+        output_config: { effort: 'high' },
         ...(template.metadata === undefined ? {} : { metadata: template.metadata }),
-        messages: mark(messages, places),
+        messages: mark(asked, places),
       }
-      const reply = await this.whileWriting(prefix, (started) =>
-        this.pool.complete(body, { ...headers, 'x-claude-code-session-id': this.sessionId }, started),
+      const reply = await this.patiently(line, () =>
+        this.whileWriting(prefix, (started) => this.pool.complete(body, { ...headers, 'x-claude-code-session-id': this.sessionId }, started)),
       )
-      const text = textOf(reply.content).replace(/^\d+\+\d+\|/, '')
-      if (text === '') throw new Error(`the model wrote no line (stop reason ${reply.stopReason ?? 'none'})`)
-      if (best === undefined || Buffer.byteLength(text) < Buffer.byteLength(best)) best = text
+      const isWhole = reply !== undefined && (reply.stopReason === 'end_turn' || reply.stopReason === 'stop_sequence')
+      const text = isWhole ? textOf(reply.content).replace(/^\d+\+\d+\|/, '') : ''
+      if (text === '') break
+      lines.push(text)
       if (Buffer.byteLength(text) <= LINE_BYTES) break
-      messages.push({ role: 'assistant', content: reply.content }, { role: 'user', content: [{ type: 'text', text: tooLong(text) }] })
+      note = [{ type: 'text', text: tooLong(text) }]
     }
-    this.built(line, best!)
+    if (lines.length === 0) console.error(`totalrecall: the model wrote no line for ${name(line)}, so its line is its source cut to ${LINE_BYTES} bytes`)
+    const best = lines.reduce<string | undefined>((shortest, each) => (shortest === undefined || Buffer.byteLength(each) < Buffer.byteLength(shortest) ? each : shortest), undefined)
+    this.chat.build(line, best ?? headBytes(flat(source), LINE_BYTES))
+  }
+
+  private async patiently(line: Line, call: () => Promise<Reply>): Promise<Reply | undefined> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const reply = await call()
+        if (attempt > 0) console.error(`totalrecall: the compaction of ${name(line)} went through after ${attempt + 1} tries`)
+        return reply
+      } catch (error) {
+        if (error instanceof PoolError && error.isLasting) {
+          console.error(`totalrecall: the pool refused the compaction of ${name(line)} for good: ${error.message}`)
+          return undefined
+        }
+        if (attempt === 0) console.error(`totalrecall: the compaction of ${name(line)} waits to try again: ${error instanceof Error ? error.message : String(error)}`)
+        await this.wait(error instanceof PoolError && error.retryAfterMs !== undefined ? error.retryAfterMs : Math.min(1000 * 2 ** attempt, LONGEST_WAIT_MS))
+      }
+    }
   }
 
   private async whileWriting<T>(prefix: string, call: (started: () => void) => Promise<T>): Promise<T> {

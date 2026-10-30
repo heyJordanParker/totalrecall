@@ -49,6 +49,7 @@ export const totalrecall = defineMod({
             properties: {
               id: { type: ['integer', 'string'], description: 'The first message of the line, or an agent\'s name' },
               n: { type: 'integer', description: 'How many messages the line covers: a power of 2' },
+              at: { type: 'integer', description: 'Where to go on in a long message or agent chat, as its last page says' },
             },
             required: ['id'],
           },

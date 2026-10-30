@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { append, end, first, mergeOnce, name, type Line, type Lines, type ViewState } from '../src/view.ts'
+import { end, first, fit, lineOf, merge, name, reach, slot, type Line, type Lines, type ViewState } from '../src/view.ts'
 
 type States = { keep: number; life: number; state: number; older: States | null } | null
 
@@ -17,24 +17,36 @@ const starts = (states: States): number[] => {
   return found.reverse()
 }
 
-const everyLineBuilt: Lines = { text: () => 'x' }
+const every = (text: string, isBuilt: (line: Line) => boolean = () => true): Lines => ({
+  text: (line) => (isBuilt(line) ? text : undefined),
+  size: (line) => (isBuilt(line) ? Buffer.byteLength(text) : 0),
+  isBuilt,
+})
 
-test('merging the most due pair makes exactly the merges push makes', () => {
+const empty = (): ViewState => ({ lines: [], size: 0, isMerging: false })
+
+test('merging the most due pairs makes exactly the merges the gist’s reference makes', () => {
   let states: States = null
-  const view: Line[] = []
+  const view = empty()
+  const lines = every('x')
   for (let t = 0; t <= 20_000; t += 1) {
     states = push(t, states)
-    view.push({ l: 0, i: t })
+    reach(view, t + 1, lines)
     const budget = starts(states).length
-    while (view.length > budget) expect(mergeOnce(view, t + 1, everyLineBuilt)).toBeDefined()
-    expect(view.map(first)).toEqual(starts(states))
+    const merged = merge(view, lines, (_, length) => length <= budget)
+    view.lines = merged.lines
+    view.size = merged.size
+    expect(view.lines.map(first)).toEqual(starts(states))
   }
 })
 
 test('the view covers every message once, oldest first', () => {
-  const view: ViewState = { lines: [], isMerging: false }
-  const lines: Lines = { text: () => 'a summary of about forty bytes, give or take' }
-  for (let id = 0; id < 20_000; id += 1) append(view, id, lines, { low: 4_000, high: 8_000 })
+  const view = empty()
+  const lines = every('a summary of about forty bytes, give or take')
+  for (let id = 0; id < 20_000; id += 1) {
+    reach(view, id + 1, lines)
+    fit(view, { high: 8_000 }, lines, true)
+  }
   let next = 0
   for (const line of view.lines) {
     expect(first(line)).toBe(next)
@@ -43,27 +55,52 @@ test('the view covers every message once, oldest first', () => {
   expect(next).toBe(20_000)
 })
 
-test('the view grows one line per message, then drops back to the low mark at once', () => {
-  const view: ViewState = { lines: [], isMerging: false }
-  const lines: Lines = { text: () => 'x'.repeat(100) }
+test('the view grows one line per message, then drops back to half at once', () => {
+  const view = empty()
+  const lines = every('x'.repeat(100))
   const sizes: number[] = []
   for (let id = 0; id < 3_000; id += 1) {
-    append(view, id, lines, { low: 4_000, high: 8_000 })
-    sizes.push(view.lines.length)
+    reach(view, id + 1, lines)
+    fit(view, { high: 8_000 }, lines, true)
+    sizes.push(view.size)
   }
-  const drops = sizes.filter((length, k) => k > 0 && length < sizes[k - 1]!)
+  const drops = sizes.filter((size, k) => k > 0 && size < sizes[k - 1]!)
   expect(drops.length).toBeGreaterThan(5)
-  expect(Math.max(...sizes) * 108).toBeLessThan(8_000 + 2 * 120)
+  expect(Math.max(...sizes)).toBeLessThanOrEqual(8_000)
+  expect(Math.min(...sizes.slice(100))).toBeGreaterThan(3_000)
 })
 
-test('a pair merges only once its parent is built', () => {
-  const view: ViewState = { lines: [], isMerging: false }
+test('a pair merges only once its parent is built, and goes on at the next message', () => {
+  const view = empty()
   const built = new Set<string>()
-  const lines: Lines = { text: (line) => (line.l === 0 || built.has(name(line)) ? 'x'.repeat(200) : undefined) }
-  for (let id = 0; id < 100; id += 1) append(view, id, lines, { low: 2_000, high: 4_000 })
+  const lines = every('x'.repeat(200), (line) => line.l === 0 || built.has(name(line)))
+  for (let id = 0; id < 100; id += 1) {
+    reach(view, id + 1, lines)
+    fit(view, { high: 4_000 }, lines, true)
+  }
   expect(view.lines.every((line) => line.l === 0)).toBe(true)
   expect(view.isMerging).toBe(true)
   built.add('0+2')
-  append(view, 100, lines, { low: 2_000, high: 4_000 })
+  reach(view, 101, lines)
+  fit(view, { high: 4_000 }, lines, true)
   expect(view.lines[0]).toEqual({ l: 1, i: 0 })
+})
+
+test('a line not summarized yet takes no room in the view', () => {
+  const view = empty()
+  const lines = every('x'.repeat(100), (line) => line.i % 2 === 0 && line.l === 0)
+  reach(view, 10, lines)
+  expect(view.size).toBe(500)
+})
+
+test('every line has its own slot, and the slot gives the line back', () => {
+  const seen = new Set<number>()
+  for (let l = 0; l < 10; l += 1) {
+    for (let i = 0; i < 64; i += 1) {
+      const at = slot({ l, i })
+      expect(seen.has(at)).toBe(false)
+      seen.add(at)
+      expect(lineOf(at)).toEqual({ l, i })
+    }
+  }
 })

@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export class Sessions {
@@ -10,6 +10,12 @@ export class Sessions {
 
   private path(history: string): string {
     return join(this.folder, `${encodeURIComponent(history)}.keys`)
+  }
+
+  histories(): string[] {
+    return readdirSync(this.folder)
+      .filter((file) => file.endsWith('.keys'))
+      .map((file) => decodeURIComponent(file.slice(0, -'.keys'.length)))
   }
 
   keys(history: string): string[] {

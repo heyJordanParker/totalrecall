@@ -6,7 +6,7 @@ import { Chat } from '../src/chat.ts'
 import { Compactor } from '../src/compactor.ts'
 import { Filter, OWN_TOOLS, type Tool } from '../src/filter.ts'
 import { Pool, type Block } from '../src/pool.ts'
-import { SYSTEM } from '../src/prompt.ts'
+import { SUBAGENT, SYSTEM } from '../src/prompt.ts'
 import { Sessions } from '../src/sessions.ts'
 
 const folders: string[] = []
@@ -16,32 +16,36 @@ afterEach(() => {
 
 type Call = { body: { messages: { role: string; content: Block[] }[]; model: string; system: Block[]; tools: Tool[] }; headers: Record<string, string> }
 
-const sse = (text: string): Response => {
+const sse = (text: string, stop = 'end_turn'): Response => {
   const events = [
     { type: 'message_start', message: { id: 'm', role: 'assistant', content: [] } },
     { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
     { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
     { type: 'content_block_stop', index: 0 },
-    { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+    { type: 'message_delta', delta: { stop_reason: stop } },
     { type: 'message_stop' },
   ]
   return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''))
 }
 
-const setup = (lines: string[] = []) => {
+const briefly = () => Bun.sleep(1)
+
+const setup = (lines: (string | Response)[] = []) => {
   const folder = mkdtempSync(join(tmpdir(), 'totalrecall-'))
   folders.push(folder)
   const calls: Call[] = []
   const send = (async (_url: string, init: RequestInit) => {
     calls.push({ body: JSON.parse(String(init.body)), headers: init.headers as Record<string, string> })
-    return sse(lines.shift() ?? 'user: a summary')
+    const next = lines.shift() ?? 'user: a summary'
+    return typeof next === 'string' ? sse(next) : next
   }) as unknown as typeof fetch
   const chat = new Chat(folder)
-  const compactor = new Compactor(chat, new Pool('http://pool', send), 'totalrecall-compaction')
+  const compactor = new Compactor(chat, new Pool('http://pool', send), 'totalrecall-compaction', briefly)
   chat.listen(compactor)
   const sessions = new Sessions(join(folder, 'sessions'))
-  const filter = new Filter(chat, compactor, sessions, 5_000)
-  return { folder, chat, compactor, sessions, filter, calls }
+  const imported = new Set<string>()
+  const filter = new Filter(chat, compactor, sessions, (session) => imported.has(session), 5_000)
+  return { folder, chat, compactor, sessions, filter, calls, imported }
 }
 
 const DEVICE = 'mac:/work'
@@ -250,7 +254,7 @@ test('a background subagent’s report starts a turn and logs as its work, and i
     { kind: 'tool', text: `Agent {"description":"Check the ads","device":"${DEVICE}"}` },
     { kind: 'echo', text: 'Async agent launched successfully.\nagentId: a9039c355724d4bfe (internal ID)' },
     { kind: 'claude', text: 'The agent is checking the ads.' },
-    { kind: 'work', text: '[Check the ads] All 13 ads are live.' },
+    { kind: 'work', text: '[Check the ads] All 13 ads are live.\n\nFull chat: mcp__totalrecall__zoom("Check the ads")' },
   ])
   const sent = answer.body as { messages: { role: string; content: Block[] }[] }
   expect(sent.messages.length).toBe(1)
@@ -275,8 +279,8 @@ test('a subagent is named by its task, a second with the same task gets a number
   const report = notice('<summary>Agent "Check the ads" finished</summary>\n<result>All 13 ads are live.</result>')
   await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([OPENING, call, launched, again, answered, waiting, report]) })
   expect([4, 6].map((id) => chat.message(id).text)).toEqual([
-    "[Check the ads 2] Two ads are down.\nagentId: b5521c0e9d7f3a6b1 (use SendMessage with to: 'b5521c0e9d7f3a6b1' to continue this agent)",
-    '[Check the ads] All 13 ads are live.',
+    "[Check the ads 2] Two ads are down.\nagentId: b5521c0e9d7f3a6b1 (use SendMessage with to: 'b5521c0e9d7f3a6b1' to continue this agent)\n\nFull chat: mcp__totalrecall__zoom(\"Check the ads 2\")",
+    '[Check the ads] All 13 ads are live.\n\nFull chat: mcp__totalrecall__zoom("Check the ads")',
   ])
   expect(chat.agent('Check the ads')?.text).toBe('user: Check every ad.')
   expect(chat.agent('Check the ads 2')?.text).toBe('user: Check every ad again.')
@@ -315,15 +319,15 @@ test('a long message waits for its summary before the next turn reads the view',
   expect(chat.text({ l: 0, i: 0 })).toBe('user: asked for a long thing')
 })
 
-test('a summary that failed is tried again as the next turn starts, so the turn never waits it out', async () => {
+test('a summary the pool is too busy for is tried again by itself, so the next turn never waits it out', async () => {
   const folder = mkdtempSync(join(tmpdir(), 'totalrecall-'))
   folders.push(folder)
   let isFailing = true
   const send = (async () => (isFailing ? new Response('overloaded', { status: 529 }) : sse('user: asked for a long thing'))) as unknown as typeof fetch
   const chat = new Chat(folder)
-  const compactor = new Compactor(chat, new Pool('http://pool', send), 'totalrecall-compaction')
+  const compactor = new Compactor(chat, new Pool('http://pool', send), 'totalrecall-compaction', briefly)
   chat.listen(compactor)
-  const filter = new Filter(chat, compactor, new Sessions(join(folder, 'sessions')), 5_000)
+  const filter = new Filter(chat, compactor, new Sessions(join(folder, 'sessions')), () => false, 5_000)
   const long = { role: 'user', content: [{ type: 'text', text: 'x'.repeat(2_000) }] }
   await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([long]) })
   await Bun.sleep(50)
@@ -381,7 +385,7 @@ test('a compaction passes through unchanged, logs what the chat missed, and its 
   expect(chat.total).toBe(3)
 })
 
-test('a compaction reads the same system prompt, tools, and instructions as the turns', async () => {
+test('a compaction reads the same system prompt and instructions as the turns, and no tools', async () => {
   const { filter, calls } = setup()
   const answer = await filter.request(DEVICE, {
     id: 'r1',
@@ -393,7 +397,8 @@ test('a compaction reads the same system prompt, tools, and instructions as the 
   const sent = answer.body as { system: Block[]; tools: Tool[]; messages: { role: string; content: Block[] }[] }
   const compaction = calls[0]!.body
   expect(compaction.system).toEqual(sent.system)
-  expect(compaction.tools).toEqual(sent.tools)
+  expect(compaction.tools).toBeUndefined()
+  expect((compaction as unknown as { output_config: unknown }).output_config).toEqual({ effort: 'high' })
   expect(compaction.messages.length).toBe(1)
   expect(compaction.messages[0]!.content.slice(0, 2)).toEqual(sent.messages[0]!.content.slice(0, 2))
   expect(compaction.messages[0]!.content.slice(2).map((block) => String(block['text']).slice(0, 40))).toEqual(['<chat>\n</chat>', 'Compaction: compress message 0 into one ', '\n</input>'])
@@ -415,16 +420,88 @@ test('a picture in a tool result is kept with its message, and its summary is wr
   expect(chat.text({ l: 0, i: 2 })).toBe('echo: a login page with an empty password field')
 })
 
-test('a line over 512 bytes is asked for again in the same conversation', async () => {
+test('a line over 512 bytes is asked for again with only a note added, never the long line itself', async () => {
   const { filter, calls, chat } = setup(['y'.repeat(600), 'user: short enough'])
   await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([{ role: 'user', content: [{ type: 'text', text: 'z'.repeat(1_000) }] }]) })
   await Bun.sleep(50)
   expect(calls.length).toBe(2)
+  const first = calls[0]!.body.messages
   const retry = calls[1]!.body.messages
-  expect(retry.map((message) => message.role)).toEqual(['user', 'assistant', 'user'])
-  expect(String(retry[2]!.content[0]!['text'])).toStartWith('Too long: your line is 600 bytes, over the 512-byte limit.')
+  expect(retry.map((message) => message.role)).toEqual(['user'])
+  expect(retry[0]!.content.slice(0, -1).map((block) => block['text'])).toEqual(first[0]!.content.map((block) => block['text']))
+  expect(String(retry[0]!.content.at(-1)!['text'])).toStartWith('Too long: your last line for this <input> was 600 bytes,')
   expect(marks(retry)).toBe(1)
   expect(chat.text({ l: 0, i: 0 })).toBe('user: short enough')
+})
+
+test('a message the model writes no line for gets its source cut to 512 bytes as its line', async () => {
+  const { filter, chat } = setup([''])
+  await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([{ role: 'user', content: [{ type: 'text', text: 'q'.repeat(1_000) }] }]) })
+  await Bun.sleep(50)
+  expect(chat.text({ l: 0, i: 0 })).toBe(`user: ${'q'.repeat(506)}`)
+})
+
+test('a reply the model stopped before its end is never a line: the source cut to 512 bytes is', async () => {
+  const { filter, chat } = setup([sse('user: I won', 'refusal')])
+  await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([{ role: 'user', content: [{ type: 'text', text: 'q'.repeat(1_000) }] }]) })
+  await Bun.sleep(50)
+  expect(chat.text({ l: 0, i: 0 })).toBe(`user: ${'q'.repeat(506)}`)
+})
+
+test('a session the import brought in logs only what follows when recall turns on in it', async () => {
+  const { filter, chat, imported } = setup()
+  imported.add('s1')
+  const ok = { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }
+  const next = { role: 'user', content: [{ type: 'text', text: 'next' }] }
+  const answer = await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([OPENING, ok, next]) })
+  expect(chat.total).toBe(1)
+  expect(chat.message(0).text).toBe('next')
+  expect((answer.body as { messages: { content: Block[] }[] }).messages[0]!.content.at(-1)!['text']).toBe('next')
+})
+
+test('a message the pool refuses for good gets its source cut to 512 bytes, and a busy pool is waited out', async () => {
+  const { filter, chat, calls } = setup([new Response('busy', { status: 429 }), new Response('bad image', { status: 400 })])
+  await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([{ role: 'user', content: [{ type: 'text', text: 'q'.repeat(1_000) }] }]) })
+  await Bun.sleep(50)
+  expect(calls.length).toBe(2)
+  expect(chat.text({ l: 0, i: 0 })).toBe(`user: ${'q'.repeat(506)}`)
+})
+
+test('a notification Claude Code adds without a task, such as a fork’s, is never the person’s words', async () => {
+  const { filter, chat } = setup()
+  const fork = { type: 'text', text: '<task-notification>\n<fork-source>\nThis session began as a fork (copy) of another session.\n</fork-source>\n</task-notification>' }
+  await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([{ role: 'user', content: [fork, { type: 'text', text: 'say hi' }] }]) })
+  expect(chat.message(0).text).toBe('say hi')
+  expect(chat.total).toBe(1)
+})
+
+test('a failed tool result logs as an error', async () => {
+  const { filter, chat } = setup()
+  const call = { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'make' } }] }
+  const result = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', is_error: true, content: 'make: *** No rule to make target' }] }
+  await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([OPENING, call, result]) })
+  expect(chat.message(2).text).toBe('error: make: *** No rule to make target')
+})
+
+test('a turn’s view leaves out imported lines not summarized yet, and shows the imported AI as ai', async () => {
+  const { filter, chat } = setup([new Response(new ReadableStream({ start: () => {} }))])
+  chat.logImported([
+    { kind: 'note', text: 'Claude Code session in /work on mac, from 2026-06-01 10:00 (imported)', date: '2026-06-01T10:00:00.000Z' },
+    { kind: 'claude', text: 'an old reply', date: '2026-06-01T10:00:01.000Z' },
+    { kind: 'user', text: 'p'.repeat(1_000), date: '2026-06-01T10:00:02.000Z' },
+  ])
+  const answer = await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([OPENING]) })
+  const opening = (answer.body as { messages: { content: Block[] }[] }).messages[0]!.content
+  expect(opening[1]!['text']).toBe('<chat>\n0+1|note: Claude Code session in /work on mac, from 2026-06-01 10:00 (imported)\n1+1|ai: an old reply\n</chat>')
+})
+
+test('a subagent reads the subagent prompt, not the main agent’s', async () => {
+  const { filter } = setup()
+  const task = { role: 'user', content: [{ type: 'text', text: 'Find the config file.' }] }
+  const answer = await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: { ...HEADERS, 'x-claude-code-agent-id': 'a1' }, body: body([task]) })
+  const system = (answer.body as { system: Block[] }).system.map((block) => block['text'])
+  expect(system).toContain(SUBAGENT)
+  expect(system).not.toContain(SYSTEM)
 })
 
 test('a rewound history logs what follows the rewind, and keeps what came before', async () => {

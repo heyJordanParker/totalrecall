@@ -40,11 +40,14 @@ const LAUNCHED = 'Async agent launched successfully'
 
 const isNotice = (block: Block): boolean => block.type === 'text' && NOTICE.test(textOf(block))
 
+const NOTIFICATION = /^\s*<task-notification>/
+
 const isWords = (block: Block): boolean =>
   block.type === 'text' &&
   !isContext(block) &&
   !isCompactionText(block) &&
   !isNotice(block) &&
+  !NOTIFICATION.test(textOf(block)) &&
   textOf(block).trim() !== '' &&
   textOf(block).trim() !== TOOL_LOADED
 
@@ -106,13 +109,17 @@ export type AgentNames = {
 
 const AGENT_ID = /agentId:\s*([\w-]+)/
 
+const report = (name: string, text: string, isLogged: boolean): string =>
+  isLogged ? `[${name}] ${text}\n\nFull chat: mcp__totalrecall__zoom("${name}")` : `[${name}] ${text}`
+
 const noticeOf = (block: Block, agents: AgentNames): Item => {
   const notice = NOTICE.exec(textOf(block))!
   const text = notice[0]
   const result = RESULT.exec(text)?.[1]
+  const name = agents.agentName(notice[1]!)
   return result === undefined
     ? { key: `echo:${hash(text)}`, kind: 'echo', text: clip(text), images: [] }
-    : { key: `work:${hash(text)}`, kind: 'work', text: `[${agents.agentName(notice[1]!) ?? notice[1]}] ${result}`, images: [] }
+    : { key: `work:${hash(text)}`, kind: 'work', text: report(name ?? notice[1]!, result, name !== undefined), images: [] }
 }
 
 const resultOf = (block: Block, call: Block | undefined, agents: AgentNames): Item => {
@@ -121,9 +128,8 @@ const resultOf = (block: Block, call: Block | undefined, agents: AgentNames): It
   const images = Array.isArray(block['content']) ? imagesOf(block['content'] as Block[]) : []
   const agent = AGENT_TOOLS.has(String(call?.['name'])) ? AGENT_ID.exec(text)?.[1] : undefined
   const name = agent === undefined ? undefined : agents.nameAgent(agent, (call!['input'] as { description: string }).description)
-  return name === undefined || text.startsWith(LAUNCHED)
-    ? { key: `echo:${id}`, kind: 'echo', text: clip(text), images }
-    : { key: `echo:${id}`, kind: 'work', text: `[${name}] ${text}`, images }
+  if (name !== undefined && !text.startsWith(LAUNCHED)) return { key: `echo:${id}`, kind: 'work', text: report(name, text, agents.agentName(agent!) !== undefined), images }
+  return { key: `echo:${id}`, kind: 'echo', text: clip(block['is_error'] === true ? `error: ${text}` : text), images }
 }
 
 const endsTurn = (messages: readonly ApiMessage[], index: number): boolean => {

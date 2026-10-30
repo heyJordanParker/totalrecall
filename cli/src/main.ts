@@ -1,9 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Chat } from './chat.ts'
-import { Compactor } from './compactor.ts'
+import { Chat, shownKind } from './chat.ts'
+import { page } from './clip.ts'
+import { AT_ONCE, Compactor } from './compactor.ts'
 import { Filter, PLUGIN, type FilteredRequest, type FilteredResponse } from './filter.ts'
 import { imageBlock } from './history.ts'
+import { Imports, runImport, type Imported } from './import.ts'
 import { Pool, type Block } from './pool.ts'
 import { chatBlocks } from './render.ts'
 import { install, PORT, poolAddresses, poolUrl, remove } from './service.ts'
@@ -42,11 +44,12 @@ const lock = (folder: string): void => {
   })
 }
 
-export const zoom = (chat: Chat, input: { id: number | string; n?: number }): Block[] => {
+export const zoom = (chat: Chat, input: { id: number | string; n?: number; at?: number }): Block[] => {
+  const at = Number.isInteger(input.at) && input.at! > 0 ? input.at! : 0
   if (typeof input.id === 'string') {
     const log = chat.agent(input.id)
     if (log === undefined) return [{ type: 'text', text: `No agent is named ${input.id}.` }]
-    return [{ type: 'text', text: log.text }, ...log.images.map(imageBlock)]
+    return [{ type: 'text', text: page(log.text, at) }, ...(at === 0 ? log.images.map(imageBlock) : [])]
   }
   const { id } = input
   const n = input.n ?? 1
@@ -55,8 +58,8 @@ export const zoom = (chat: Chat, input: { id: number | string; n?: number }): Bl
   if (n === 1) {
     const message = chat.message(id)
     return [
-      { type: 'text', text: `${id}|${message.kind}: ${message.text}` },
-      ...(message.images ?? []).map(imageBlock),
+      { type: 'text', text: `${id}|${shownKind(message)}: ${page(message.text, at)}` },
+      ...(at === 0 ? (message.images ?? []).map(imageBlock) : []),
     ]
   }
   const lines = children({ l: Math.log2(n), i: id / n }).filter((line) => line.i * 2 ** line.l < chat.total)
@@ -70,12 +73,14 @@ export const date = (chat: Chat, id: number): string => {
 }
 
 const view = (chat: Chat): string =>
-  chatBlocks(chat.view.lines.map((line) => render(line, chat))).blocks.map((block) => block['text']).join('')
+  chatBlocks(chat.rendered()).blocks.map((block) => block['text']).join('')
 
-const tools = (chat: Chat, path: string, input: Record<string, unknown>): Response | undefined => {
-  if (path === '/zoom') return Response.json({ content: zoom(chat, input as { id: number | string; n?: number }) })
+const tools = (chat: Chat, imports: Imports, path: string, input: Record<string, unknown>): Response | undefined => {
+  if (path === '/zoom') return Response.json({ content: zoom(chat, input as { id: number | string; n?: number; at?: number }) })
   if (path === '/date') return Response.json({ text: date(chat, Number(input['id'])) })
   if (path === '/view') return Response.json({ text: view(chat) })
+  if (path === '/imported') return Response.json(imports.state())
+  if (path === '/import') return Response.json({ messages: imports.add(input['sessions'] as Imported[]) })
   return undefined
 }
 
@@ -92,7 +97,9 @@ const serve = async (folder: string): Promise<void> => {
   lock(folder)
   const chat = new Chat(folder)
   const compactor = new Compactor(chat, new Pool(poolUrl()), `${PLUGIN}-compaction`)
-  const filter = new Filter(chat, compactor, new Sessions(join(folder, 'sessions')))
+  const sessions = new Sessions(join(folder, 'sessions'))
+  const imports = new Imports(chat, sessions, join(folder, 'imported.json'))
+  const filter = new Filter(chat, compactor, sessions, (session) => imports.has(session))
   chat.listen(compactor)
   const error = (failure: Error): Response => {
     console.error(`totalrecall: ${failure.message}`)
@@ -106,7 +113,7 @@ const serve = async (folder: string): Promise<void> => {
       const url = new URL(request.url)
       const input = await bodyOf(request)
       if (input === undefined) return notJson(request)
-      const answer = tools(chat, url.pathname, input)
+      const answer = tools(chat, imports, url.pathname, input)
       if (answer !== undefined) return answer
       if (url.pathname === '/strip' && 'request' in input) return Response.json(filter.strip(input['request'] as FilteredRequest))
       if (url.pathname !== '/on') return new Response('No such route.', { status: 404 })
@@ -124,8 +131,8 @@ const serve = async (folder: string): Promise<void> => {
       async fetch(request) {
         const input = await bodyOf(request)
         if (input === undefined) return notJson(request)
-        const answer = tools(chat, new URL(request.url).pathname, input)
-        return answer ?? new Response('Only zoom, date, and view answer here.', { status: 404 })
+        const answer = tools(chat, imports, new URL(request.url).pathname, input)
+        return answer ?? new Response('Only zoom, date, view, imported, and import answer here.', { status: 404 })
       },
       error,
     })
@@ -135,12 +142,26 @@ const serve = async (folder: string): Promise<void> => {
 
 const isLoopback = (address: string): boolean => address === '::1' || address.startsWith('127.')
 
+const program = (path: string, body: object): Promise<unknown> => {
+  const host = new URL(poolUrl()).hostname
+  const url = `http://${host}:${PORT}${path}`
+  return fetch(url, { method: 'POST', body: JSON.stringify(body) }).then(async (response) => {
+    if (!response.ok) throw new Error(`${url} answered ${response.status}: ${await response.text()}`)
+    return response.json()
+  })
+}
+
 const [command, argument] = process.argv.slice(2)
 if (command === '--version') console.log(VERSION)
 else if (command === 'serve' && argument !== undefined) await serve(argument)
 else if (command === 'service' && argument === 'install' && process.argv[4] !== undefined) await install(process.argv[4])
 else if (command === 'service' && argument === 'remove') remove()
-else {
-  console.error('Usage: totalrecall serve <data folder> | totalrecall service install <data folder> | totalrecall service remove')
+else if (command === 'import') {
+  await runImport(process.argv.slice(3), program, (line) => console.log(line), AT_ONCE).catch((error: unknown) => {
+    console.error(`totalrecall import: ${error instanceof Error ? error.message : String(error)}`)
+    process.exit(1)
+  })
+} else {
+  console.error('Usage: totalrecall serve <data folder> | totalrecall service install <data folder> | totalrecall service remove | totalrecall import [since <YYYY-MM-DD>] [tools] [<export>…] [go]')
   process.exit(2)
 }

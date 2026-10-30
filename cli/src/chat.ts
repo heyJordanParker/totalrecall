@@ -1,6 +1,8 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync, writeSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
-import { append, children, CHAT, COMPACTION, key, parent, shrink, type Line, type Lines, type ViewState } from './view.ts'
+import { pages } from './clip.ts'
+import { Log } from './log.ts'
+import { CHAT, children, COMPACTION, end, fit, flat, lineOf, parent, reach, render, slot, viewEnd, type Line, type Lines, type ViewState } from './view.ts'
 
 export type Kind = 'user' | 'claude' | 'tool' | 'echo' | 'work' | 'note'
 export type Image = { readonly media_type: string; readonly data: string }
@@ -11,193 +13,249 @@ export type Message = {
   readonly size: number
   readonly date: string
   readonly images?: readonly Image[]
+  readonly imported?: true
 }
+export type Entry = { readonly kind: Kind; readonly text: string; readonly date?: string; readonly images?: readonly Image[] }
 
 export const LINE_BYTES = 512
-export const MESSAGE_CHARACTERS = 30_000
+const IMPORTED = 1
+const MOST_EXTRA = 65_535
 const NAMES = 'names.json'
 
-type Place = { readonly file: string; readonly offset: number; readonly length: number; readonly kind: Kind; readonly date: string }
-type Node = { readonly text: string; readonly size: number }
+export const shownKind = ({ kind, imported }: { readonly kind: Kind; readonly imported?: boolean }): string =>
+  imported === true && (kind === 'claude' || kind === 'tool') ? 'ai' : kind
+
+export const shown = (message: { readonly kind: Kind; readonly text: string; readonly imported?: boolean }): string => `${shownKind(message)}: ${message.text}`
+
+type Node = { readonly l: number; readonly i: number; readonly text: string; readonly size: number }
 type SavedView = { lines: [number, number][]; isMerging: boolean }
 
 const bytes = (text: string): number => Buffer.byteLength(text)
-const day = (date: Date): string =>
-  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
-
-class DayFiles {
-  private open: { name: string; fd: number; size: number } | undefined
-
-  constructor(private readonly folder: string) {
-    mkdirSync(folder, { recursive: true })
-  }
-
-  write(record: object, now: Date): { file: string; offset: number; length: number } {
-    const name = `${day(now)}.jsonl`
-    if (this.open?.name !== name) {
-      if (this.open !== undefined) closeSync(this.open.fd)
-      const fd = openSync(join(this.folder, name), 'a')
-      this.open = { name, fd, size: statSync(join(this.folder, name)).size }
-    }
-    const line = Buffer.from(`${JSON.stringify(record)}\n`)
-    writeSync(this.open.fd, line)
-    fsyncSync(this.open.fd)
-    const offset = this.open.size
-    this.open.size += line.length
-    return { file: join(this.folder, name), offset, length: line.length - 1 }
-  }
-
-  *read(): Generator<{ record: unknown; file: string; offset: number; length: number }> {
-    for (const name of readdirSync(this.folder).filter((entry) => entry.endsWith('.jsonl')).sort()) {
-      const file = join(this.folder, name)
-      const content = readFileSync(file)
-      let offset = 0
-      while (offset < content.length) {
-        const next = content.indexOf(10, offset)
-        const stop = next === -1 ? content.length : next
-        if (stop > offset) yield { record: JSON.parse(content.subarray(offset, stop).toString()), file, offset, length: stop - offset }
-        offset = stop + 1
-      }
-    }
-  }
-}
 
 const saveJson = (path: string, value: unknown): void => {
   writeFileSync(`${path}.tmp`, JSON.stringify(value))
   renameSync(`${path}.tmp`, path)
 }
 
-const loadView = (path: string): ViewState | undefined => {
-  if (!existsSync(path)) return undefined
-  const saved = JSON.parse(readFileSync(path, 'utf8')) as SavedView
-  return { lines: saved.lines.map(([l, i]) => ({ l, i })), isMerging: saved.isMerging }
+const at = (sorted: readonly number[], id: number): number => {
+  let low = 0
+  let high = sorted.length
+  while (low < high) {
+    const middle = (low + high) >> 1
+    if (sorted[middle]! < id) low = middle + 1
+    else high = middle
+  }
+  return low
 }
-
-const saveView = (path: string, view: ViewState): void =>
-  saveJson(path, { lines: view.lines.map(({ l, i }) => [l, i]), isMerging: view.isMerging } satisfies SavedView)
 
 export type ChatEvents = {
   ready(line: Line): void
+  changed(): void
 }
 
 export class Chat implements Lines {
   readonly view: ViewState
   readonly compactionView: ViewState
-  private readonly places: Place[] = []
-  private readonly nodes = new Map<string, Node>()
-  private readonly main: DayFiles
-  private readonly tree: DayFiles
+  private readonly main: Log
+  private readonly tree: Log
+  private readonly unbuilt: [number[], number[]] = [[], []]
   private readonly agents: string
   private readonly names: Map<string, string>
+  private batch: Map<number, Node> | undefined
+  private count = 0
   private listener: ChatEvents | undefined
 
   constructor(private readonly folder: string) {
-    this.main = new DayFiles(join(folder, 'main'))
-    this.tree = new DayFiles(join(folder, 'tree'))
+    this.main = new Log(join(folder, 'main'), join(folder, 'main.index'), (record) =>
+      typeof record['i'] === 'number' ? { slot: record['i'], extra: record['imported'] === true ? IMPORTED : 0 } : undefined,
+    )
+    this.tree = new Log(join(folder, 'tree'), join(folder, 'tree.index'), (record) =>
+      typeof record['l'] === 'number' && typeof record['i'] === 'number' && typeof record['text'] === 'string'
+        ? { slot: slot({ l: record['l'], i: record['i'] }), extra: Math.min(bytes(record['text']), MOST_EXTRA) }
+        : undefined,
+    )
+    while (this.main.has(this.count)) this.count += 1
+    for (let i = 0; i < this.count; i += 1) if (!this.tree.has(slot({ l: 0, i }))) this.unbuilt[this.sideOf(i)].push(i)
     this.agents = join(folder, 'agents')
     mkdirSync(this.agents, { recursive: true })
     const names = join(this.agents, NAMES)
     this.names = new Map(existsSync(names) ? Object.entries(JSON.parse(readFileSync(names, 'utf8')) as Record<string, string>) : [])
-    for (const { record, file, offset, length } of this.main.read()) {
-      const message = record as Message
-      this.places[message.i] = { file, offset, length, kind: message.kind, date: message.date }
-    }
-    for (const { record } of this.tree.read()) {
-      const { l, i, text, size } = record as Line & Node
-      this.nodes.set(key({ l, i }), { text, size })
-    }
-    this.view = loadView(join(folder, 'view.json')) ?? { lines: [], isMerging: false }
-    this.compactionView = loadView(join(folder, 'compaction-view.json')) ?? { lines: [], isMerging: false }
+    this.view = this.loadView('view.json')
+    this.compactionView = this.loadView('compaction-view.json')
+    reach(this.view, this.count, this)
+    reach(this.compactionView, this.seenEnd(), this)
   }
 
   get total(): number {
-    return this.places.length
+    return this.count
   }
 
   listen(listener: ChatEvents): void {
     this.listener = listener
-    for (let id = 0; id < this.total; id += 1) {
-      if (!this.nodes.has(key({ l: 0, i: id }))) listener.ready({ l: 0, i: id })
-    }
-    for (const built of [...this.nodes.keys()]) {
-      const [l, i] = built.split(':').map(Number) as [number, number]
-      if (i % 2 === 0) this.offerParent({ l, i })
+    for (const side of this.unbuilt) for (const i of side) listener.ready({ l: 0, i })
+    for (let built = 0; built < this.tree.length; built += 1) {
+      const line = lineOf(built)
+      if (line.i % 2 === 0 && this.tree.has(built)) this.offerParent(line)
     }
   }
 
   text(line: Line): string | undefined {
-    return this.nodes.get(key(line))?.text
+    return this.batch?.get(slot(line))?.text ?? (this.tree.read(slot(line))?.['text'] as string | undefined)
+  }
+
+  size(line: Line): number {
+    return this.batch?.get(slot(line))?.size ?? this.tree.entry(slot(line))?.extra ?? 0
   }
 
   isBuilt(line: Line): boolean {
-    return this.nodes.has(key(line))
+    return this.batch?.has(slot(line)) === true || this.tree.has(slot(line))
   }
 
   message(id: number): Message {
-    const place = this.places[id]
-    if (place === undefined) throw new Error(`There is no message ${id}.`)
-    const content = Buffer.alloc(place.length)
-    const fd = openSync(place.file, 'r')
-    try {
-      readSync(fd, content, 0, place.length, place.offset)
-    } finally {
-      closeSync(fd)
-    }
-    return JSON.parse(content.toString()) as Message
+    const record = this.main.read(id)
+    if (record === undefined || id >= this.count) throw new Error(`There is no message ${id}.`)
+    return record as Message
   }
 
   date(id: number): string {
-    const place = this.places[id]
-    if (place === undefined) throw new Error(`There is no message ${id}.`)
-    return place.date
+    return this.message(id).date
+  }
+
+  isImported(id: number): boolean {
+    return ((this.main.entry(id)?.extra ?? 0) & IMPORTED) !== 0
+  }
+
+  sideOf(id: number): 0 | 1 {
+    return this.isImported(id) ? 1 : 0
+  }
+
+  lineSide(line: Line): 0 | 1 {
+    return this.sideOf(end(line) - 1)
+  }
+
+  unbuiltAt(side: 0 | 1, k: number): number {
+    return this.unbuilt[side][k] ?? this.count
+  }
+
+  hasUnbuilt(side: 0 | 1, from: number, to: number): boolean {
+    const found = this.unbuilt[side][at(this.unbuilt[side], from)]
+    return found !== undefined && found < to
+  }
+
+  unbuiltCount(side: 0 | 1): number {
+    return this.unbuilt[side].length
+  }
+
+  rendered(): string[] {
+    const isImportShown = this.view.size <= CHAT.high
+    return this.view.lines.filter((line) => this.lineSide(line) === 0 || (isImportShown && this.isBuilt(line))).map((line) => render(line, this))
+  }
+
+  source(line: Line): string {
+    if (line.l === 0) return shown(this.message(line.i))
+    const [a, b] = children(line)
+    return `${flat(this.text(a)!)}\n${flat(this.text(b)!)}`
   }
 
   log(kind: Kind, text: string, images: readonly Image[] = [], now = new Date()): number[] {
-    const ids: number[] = []
-    for (let start = 0; start === 0 || start < text.length; start += MESSAGE_CHARACTERS) {
-      ids.push(this.append(kind, text.slice(start, start + MESSAGE_CHARACTERS), start === 0 ? images : [], now))
-    }
-    return ids
+    return this.append([{ kind, text, images }], false, now)
   }
 
-  private append(kind: Kind, text: string, images: readonly Image[], now: Date): number {
-    const i = this.total
-    const date = now.toISOString()
-    const record: Message = { i, kind, text, size: bytes(text), date, ...(images.length > 0 ? { images } : {}) }
-    const place = this.main.write(record, now)
-    this.places[i] = { ...place, kind, date }
-    const line = { l: 0, i }
-    const own = `${kind}: ${text}`
-    if (bytes(own) <= LINE_BYTES && images.length === 0) this.build(line, own, now)
-    else this.listener?.ready(line)
-    if (append(this.view, i, this, CHAT)) {
-      this.compactionView.lines = [...this.view.lines]
-      this.compactionView.isMerging = !shrink(this.compactionView.lines, this.total, this, COMPACTION.low)
-    } else {
-      append(this.compactionView, i, this, COMPACTION)
+  logImported(entries: readonly Entry[], now = new Date()): number[] {
+    return this.append(entries, true, now)
+  }
+
+  private append(entries: readonly Entry[], isImported: boolean, now: Date): number[] {
+    const records: Message[] = []
+    for (const entry of entries) {
+      pages(entry.text).forEach((text, k) => {
+        const images = k === 0 ? (entry.images ?? []) : []
+        records.push({
+          i: this.count + records.length,
+          kind: entry.kind,
+          text,
+          size: bytes(text),
+          date: entry.date ?? now.toISOString(),
+          ...(images.length > 0 ? { images } : {}),
+          ...(isImported ? { imported: true as const } : {}),
+        })
+      })
     }
-    saveView(join(this.folder, 'view.json'), this.view)
-    saveView(join(this.folder, 'compaction-view.json'), this.compactionView)
-    return i
+    this.main.write(records.map((record) => ({ record, slot: record.i, extra: isImported ? IMPORTED : 0 })), now)
+    this.count += records.length
+    this.batch = new Map()
+    for (const record of records) {
+      const own = shown(record)
+      if (bytes(own) <= LINE_BYTES && record.images === undefined) {
+        this.build({ l: 0, i: record.i }, own, now)
+      } else {
+        this.unbuilt[this.sideOf(record.i)].push(record.i)
+        this.listener?.ready({ l: 0, i: record.i })
+      }
+    }
+    const built = [...this.batch.values()]
+    this.batch = undefined
+    this.tree.write(built.map((node) => ({ record: node, slot: slot(node), extra: Math.min(node.size, MOST_EXTRA) })), now)
+    reach(this.view, this.count, this)
+    reach(this.compactionView, this.seenEnd(), this)
+    fit(this.view, CHAT, this, true)
+    fit(this.compactionView, COMPACTION, this, true)
+    this.saveView('view.json', this.view)
+    this.saveView('compaction-view.json', this.compactionView)
+    this.listener?.changed()
+    return records.map((record) => record.i)
   }
 
   build(line: Line, text: string, now = new Date()): void {
-    if (this.nodes.has(key(line))) return
-    const size = bytes(text)
-    this.tree.write({ l: line.l, i: line.i, text, size }, now)
-    this.nodes.set(key(line), { text, size })
+    if (this.isBuilt(line)) return
+    const node: Node = { l: line.l, i: line.i, text, size: bytes(text) }
+    if (this.batch !== undefined) this.batch.set(slot(line), node)
+    else this.tree.write([{ record: node, slot: slot(line), extra: Math.min(node.size, MOST_EXTRA) }], now)
+    if (line.l === 0) {
+      const side = this.unbuilt[this.sideOf(line.i)]
+      const found = at(side, line.i)
+      if (side[found] === line.i) side.splice(found, 1)
+      for (const view of [this.view, this.compactionView]) if (line.i < viewEnd(view)) view.size += node.size
+    }
     this.offerParent(line, now)
+    if (this.batch !== undefined) return
+    reach(this.compactionView, this.seenEnd(), this)
+    fit(this.view, CHAT, this, false)
+    fit(this.compactionView, COMPACTION, this, false)
+    this.listener?.changed()
+  }
+
+  private seenEnd(): number {
+    return Math.min(this.count, this.unbuiltAt(0, 0), this.unbuiltAt(1, 0))
   }
 
   private offerParent(line: Line, now = new Date()): void {
     const above = parent(line)
-    if (this.nodes.has(key(above))) return
+    if (this.isBuilt(above)) return
     const [a, b] = children(above)
-    const left = this.nodes.get(key(a))
-    const right = this.nodes.get(key(b))
-    if (left === undefined || right === undefined) return
-    if (left.size + 1 + right.size <= LINE_BYTES) this.build(above, `${left.text}\n${right.text}`, now)
+    if (!this.isBuilt(a) || !this.isBuilt(b)) return
+    const source = this.source(above)
+    if (bytes(source) <= LINE_BYTES) this.build(above, source, now)
     else this.listener?.ready(above)
+  }
+
+  private loadView(file: string): ViewState {
+    const path = join(this.folder, file)
+    const saved = ((): SavedView | undefined => {
+      try {
+        return existsSync(path) ? (JSON.parse(readFileSync(path, 'utf8')) as SavedView) : undefined
+      } catch {
+        return undefined
+      }
+    })()
+    const lines = (saved?.lines ?? []).map(([l, i]) => ({ l, i }))
+    const isWhole = lines.every((line, k) => (k === 0 ? line.i === 0 : end(lines[k - 1]!) === line.i * 2 ** line.l) && (line.l === 0 || this.isBuilt(line)))
+    const kept = isWhole ? lines : []
+    return { lines: kept, size: kept.reduce((total, line) => total + this.size(line), 0), isMerging: isWhole && saved?.isMerging === true }
+  }
+
+  private saveView(file: string, view: ViewState): void {
+    saveJson(join(this.folder, file), { lines: view.lines.map(({ l, i }) => [l, i]), isMerging: view.isMerging } satisfies SavedView)
   }
 
   logAgent(id: string, kind: Kind, text: string, images: readonly Image[] = [], now = new Date()): void {
@@ -232,8 +290,13 @@ export class Chat implements Lines {
     if (!existsSync(path)) return undefined
     const records = readFileSync(path, 'utf8')
       .split('\n')
-      .filter((line) => line !== '')
-      .map((line) => JSON.parse(line) as { kind: Kind; text: string; images?: Image[] })
+      .flatMap((line) => {
+        try {
+          return line === '' ? [] : [JSON.parse(line) as { kind: Kind; text: string; images?: Image[] }]
+        } catch {
+          return []
+        }
+      })
     return { text: records.map(({ kind, text }) => `${kind}: ${text}`).join('\n\n'), images: records.flatMap((record) => record.images ?? []) }
   }
 }
