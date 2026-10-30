@@ -4,6 +4,30 @@ What changed in each version of totalrecall, for the people who use it. cmod pub
 
 ## [Unreleased]
 
+## [0.2.0]
+
+### Added
+- `totalrecall import` brings your past Claude Code and Codex sessions into the chat, on each computer you run it on, and Claude.ai and ChatGPT exports too. It lists what it found and how many summaries that takes; add `go` to import. `since <day>` limits it to recent sessions, and `tools` brings tool calls too. Running it again adds only what is new, and a session total recall logged as it ran is left out. Turns never wait on an import's summaries.
+- Claude reads an imported AI's replies and tool calls as `ai`, not as its own.
+- `zoom` pages through a long message or a subagent's chat.
+- A subagent reads a subagent's prompt: do what its task says, not what your last message says.
+
+### Changed
+- Summaries run 64 at once for the chat, and 64 more for an import, at high effort.
+- A busy or unreachable pool only delays a summary: it is tried again until it goes through.
+- The chat keeps an index beside its logs, so the program holds only what a turn reads and starts fast however long the chat grows. A chat from before builds its index at its first start.
+
+### Fixed
+- A message the model won't summarize gets its own text, cut to 512 bytes, as its summary, so turns never wait on it.
+- A failed tool result is logged as an error.
+- A subagent's report says how to open its whole chat.
+- A log line a crash cut short is skipped, so the chat still starts.
+- A long message is split where a line ends.
+- A notice Claude Code adds without a task, such as a fork's, is never logged as your words.
+- A summary the model stopped before its end is never kept.
+- A session you imported logs only what follows when you turn recall on in it.
+- While a large import's summaries catch up, turns read the live chat without it.
+
 ## [0.1.1]
 
 ### Changed
