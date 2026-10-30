@@ -4,6 +4,11 @@ What changed in each version of totalrecall, for the people who use it. cmod pub
 
 ## [Unreleased]
 
+## [0.2.1]
+
+### Fixed
+- Summaries start as soon as the program starts or an import lands. They no longer wait for the first recall turn after each restart.
+
 ## [0.2.0]
 
 ### Added

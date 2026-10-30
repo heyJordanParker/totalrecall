@@ -11254,10 +11254,10 @@ function resultOf2(value) {
   return JSON.stringify(value);
 }
 
-// ../../../private/var/folders/t0/0bwlr70s62g8frgryzv4p4fr0000gn/T/cmod-publish-totalrecall-Yyvi5O/release/src/state.ts
+// ../../../private/var/folders/t0/0bwlr70s62g8frgryzv4p4fr0000gn/T/cmod-publish-totalrecall-xLtO1J/release/src/state.ts
 var initialState = { session: { isOn: false }, memory: { hasTools: false } };
 
-// ../../../private/var/folders/t0/0bwlr70s62g8frgryzv4p4fr0000gn/T/cmod-publish-totalrecall-Yyvi5O/release/src/mod.tsx
+// ../../../private/var/folders/t0/0bwlr70s62g8frgryzv4p4fr0000gn/T/cmod-publish-totalrecall-xLtO1J/release/src/mod.tsx
 var NAME = "totalrecall";
 var PORT = 8320;
 var LOCAL_POOL = "http://127.0.0.1:8317";
@@ -11360,7 +11360,7 @@ var totalrecall = defineMod({
   }
 });
 
-// ../../../private/var/folders/t0/0bwlr70s62g8frgryzv4p4fr0000gn/T/cmod-publish-totalrecall-Yyvi5O/release/hooks/register.ts
+// ../../../private/var/folders/t0/0bwlr70s62g8frgryzv4p4fr0000gn/T/cmod-publish-totalrecall-xLtO1J/release/hooks/register.ts
 function register(addHook, options) {
   registerMod(addHook, totalrecall, options);
 }
