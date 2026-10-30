@@ -32,8 +32,6 @@ export const totalrecall = defineMod({
       return JSON.parse(response.text)
     }
 
-    const isServing = (): Promise<boolean> => post('/date', { id: 0 }).then(() => true, () => false)
-
     let device: string | undefined
     const deviceOf = async (): Promise<string> => {
       device ??= (await process.run(['hostname'])).stdout.trim()
@@ -86,11 +84,13 @@ export const totalrecall = defineMod({
       return undefined
     })
 
-    sessions.current.beforeContextEnd(async () =>
-      mod.state.session.isOn && !(await isServing())
+    sessions.current.beforeContextEnd(async () => {
+      if (!mod.state.session.isOn) return undefined
+      const view = await post('/view', {}).then((answer) => (answer as { text: string }).text, () => undefined)
+      return view === undefined
         ? { refuse: 'Total recall can\'t reach its program, so a compaction now would drop turns the chat hasn\'t logged yet. Try again once it answers.' }
-        : undefined,
-    )
+        : { summary: view }
+    })
 
     sessions.current.onTurnEnd(async () => {
       if (!mod.state.session.isOn) return

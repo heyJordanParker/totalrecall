@@ -5,6 +5,7 @@ import { Compactor } from './compactor.ts'
 import { Filter, PLUGIN, type FilteredRequest, type FilteredResponse } from './filter.ts'
 import { imageBlock } from './history.ts'
 import { Pool, type Block } from './pool.ts'
+import { chatBlocks } from './render.ts'
 import { install, PORT, poolAddresses, poolUrl, remove } from './service.ts'
 import { Sessions } from './sessions.ts'
 import { children, render } from './view.ts'
@@ -68,9 +69,13 @@ export const date = (chat: Chat, id: number): string => {
   return when.toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' })
 }
 
+const view = (chat: Chat): string =>
+  chatBlocks(chat.view.lines.map((line) => render(line, chat))).blocks.map((block) => block['text']).join('')
+
 const tools = (chat: Chat, path: string, input: Record<string, unknown>): Response | undefined => {
   if (path === '/zoom') return Response.json({ content: zoom(chat, input as { id: number | string; n?: number }) })
   if (path === '/date') return Response.json({ text: date(chat, Number(input['id'])) })
+  if (path === '/view') return Response.json({ text: view(chat) })
   return undefined
 }
 
@@ -120,7 +125,7 @@ const serve = async (folder: string): Promise<void> => {
         const input = await bodyOf(request)
         if (input === undefined) return notJson(request)
         const answer = tools(chat, new URL(request.url).pathname, input)
-        return answer ?? new Response('Only zoom and date answer here.', { status: 404 })
+        return answer ?? new Response('Only zoom, date, and view answer here.', { status: 404 })
       },
       error,
     })
