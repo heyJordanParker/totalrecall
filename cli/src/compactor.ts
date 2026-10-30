@@ -1,22 +1,18 @@
 import { LINE_BYTES, type Chat, type ChatEvents } from './chat.ts'
 import { imageBlock } from './history.ts'
 import { PoolError, textOf, type Block, type Pool, type Reply } from './pool.ts'
-import { compressTask, headBytes, mergeTask, tooLong } from './prompt.ts'
+import { compressTask, headBytes, mergeTask, SYSTEM, tooLong } from './prompt.ts'
 import { chatBlocks, mark, type Place } from './render.ts'
 import { children, COMPACTION, end, first, flat, name, render, slot, type Line } from './view.ts'
-
-export type Template = {
-  readonly headers: Readonly<Record<string, string>>
-  readonly system: readonly Block[]
-  readonly instructions: readonly { role: string; content: Block[] }[]
-  readonly metadata?: unknown
-}
 
 export const COMPACTION_MODEL = 'claude-haiku-5-5'
 export const AT_ONCE = 64
 const TRIES = 5
 const LONGEST_WAIT_MS = 60_000
-const DROPPED_HEADERS = new Set(['content-length', 'host', 'connection', 'accept-encoding', 'x-claude-code-agent-id', 'x-claude-code-agent-type'])
+const COMPACTION_SYSTEM: readonly Block[] = [
+  { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+  { type: 'text', text: SYSTEM },
+]
 
 type Side = 0 | 1
 type Waiter = { readonly before: number; readonly resolve: () => void }
@@ -39,7 +35,6 @@ export class Compactor implements ChatEvents {
   private readonly running = new Map<number, Side>()
   private readonly waiters: Waiter[] = []
   private readonly writing = new Map<string, Promise<void>>()
-  private template: Template | undefined
   private isPumping = false
   private isPumpedAgain = false
 
@@ -49,12 +44,6 @@ export class Compactor implements ChatEvents {
     private readonly sessionId: string,
     private readonly wait: (ms: number) => Promise<unknown> = (ms) => Bun.sleep(ms),
   ) {}
-
-  useTemplate(template: Template): void {
-    if (this.template !== undefined) return
-    this.template = template
-    this.pump()
-  }
 
   ready(line: Line): void {
     insert((this.queues[this.chat.lineSide(line)][line.l] ??= []), line.i)
@@ -93,7 +82,6 @@ export class Compactor implements ChatEvents {
   }
 
   private pump(): void {
-    if (this.template === undefined) return
     if (this.isPumping) {
       this.isPumpedAgain = true
       return
@@ -113,7 +101,7 @@ export class Compactor implements ChatEvents {
             const source = this.chat.source(line)
             const isPictured = line.l === 0 && this.chat.message(line.i).images !== undefined
             if (Buffer.byteLength(source) <= LINE_BYTES && !isPictured) this.chat.build(line, source)
-            else this.run(line, side, this.template)
+            else this.run(line, side)
           }
         }
       } while (this.isPumpedAgain)
@@ -122,9 +110,9 @@ export class Compactor implements ChatEvents {
     }
   }
 
-  private run(line: Line, side: Side, template: Template): void {
+  private run(line: Line, side: Side): void {
     this.running.set(slot(line), side)
-    this.compact(line, template)
+    this.compact(line)
       .catch(async (error: unknown) => {
         console.error(`totalrecall: compaction of ${name(line)} failed: ${error instanceof Error ? error.message : String(error)}`)
         await this.wait(LONGEST_WAIT_MS)
@@ -154,31 +142,24 @@ export class Compactor implements ChatEvents {
     return [{ type: 'text', text: mergeTask(name(a), name(b), source, first(line), end(line) - 1) }]
   }
 
-  private async compact(line: Line, template: Template): Promise<void> {
+  private async compact(line: Line): Promise<void> {
     const source = this.chat.source(line)
     const view = chatBlocks(this.context(line).map((each) => render(each, this.chat)))
-    const messages = template.instructions.map((message) => ({ role: message.role, content: [...message.content] }))
-    const places: Place[] = messages.length === 0 ? [] : [{ message: messages.length - 1, block: messages.at(-1)!.content.length - 1 }]
-    const into = messages.at(-1)?.role === 'user' ? messages.at(-1)! : messages[messages.push({ role: 'user', content: [] }) - 1]!
-    if (view.marked >= 0) places.push({ message: messages.indexOf(into), block: into.content.length + view.marked })
-    into.content.push(...view.blocks, ...this.task(line, source))
-    const headers = Object.fromEntries(Object.entries(template.headers).filter(([header]) => !DROPPED_HEADERS.has(header)))
-    const prefix = String(Bun.hash(JSON.stringify([template.system, template.instructions, view.blocks.slice(0, view.marked + 1)])))
+    const content = [...view.blocks, ...this.task(line, source)]
+    const places: Place[] = view.marked >= 0 ? [{ message: 0, block: view.marked }] : []
+    const prefix = String(Bun.hash(JSON.stringify(view.blocks.slice(0, view.marked + 1))))
+    const headers = { 'anthropic-version': '2023-06-01', 'x-claude-code-session-id': this.sessionId }
     const lines: string[] = []
     for (let note: Block[] = []; lines.length < TRIES; ) {
-      const asked = messages.map((message) => (message === into ? { ...message, content: [...message.content, ...note] } : message))
       const body = {
         model: COMPACTION_MODEL,
         max_tokens: 32_000,
-        system: template.system,
+        system: COMPACTION_SYSTEM,
         thinking: { type: 'adaptive' },
         output_config: { effort: 'high' },
-        ...(template.metadata === undefined ? {} : { metadata: template.metadata }),
-        messages: mark(asked, places),
+        messages: mark([{ role: 'user', content: [...content, ...note] }], places),
       }
-      const reply = await this.patiently(line, () =>
-        this.whileWriting(prefix, (started) => this.pool.complete(body, { ...headers, 'x-claude-code-session-id': this.sessionId }, started)),
-      )
+      const reply = await this.patiently(line, () => this.whileWriting(prefix, (started) => this.pool.complete(body, headers, started)))
       const isWhole = reply !== undefined && (reply.stopReason === 'end_turn' || reply.stopReason === 'stop_sequence')
       const text = isWhole ? textOf(reply.content).replace(/^\d+\+\d+\|/, '') : ''
       if (text === '') break

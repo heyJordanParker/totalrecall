@@ -312,7 +312,6 @@ test('a long message waits for its summary before the next turn reads the view',
   expect(calls[0]!.body.model).toBe('claude-haiku-5-5')
   expect(calls[0]!.headers['x-claude-code-session-id']).toBe('totalrecall-compaction')
   expect(calls[0]!.headers['x-oneclaude-cache-key']).toBeUndefined()
-  expect(calls[0]!.body.system).toEqual((answer.body as { system: Block[] }).system)
   expect(String(calls[0]!.body.messages[0]!.content.at(-2)!['text'])).toStartWith('Compaction: compress message 0 into one line')
   const opening = (answer.body as { messages: { content: Block[] }[] }).messages[0]!.content
   expect(opening[0]!['text']).toBe('<chat>\n0+1|user: asked for a long thing\n1+1|claude: ok\n</chat>')
@@ -385,24 +384,18 @@ test('a compaction passes through unchanged, logs what the chat missed, and its 
   expect(chat.total).toBe(3)
 })
 
-test('a compaction reads the same system prompt and instructions as the turns, and no tools', async () => {
-  const { filter, calls } = setup()
-  const answer = await filter.request(DEVICE, {
-    id: 'r1',
-    path: '/v1/messages',
-    headers: HEADERS,
-    body: body([{ role: 'user', content: [CONTEXT, { type: 'text', text: 'w'.repeat(1_000) }] }, SESSION_START]),
-  })
+test('an imported backlog is summarized from the moment it lands, before any turn, with no tools', async () => {
+  const { chat, calls } = setup(['user: an old long question'])
+  chat.logImported([{ kind: 'user', text: 'w'.repeat(1_000), date: '2026-06-01T10:00:00.000Z' }])
   await Bun.sleep(50)
-  const sent = answer.body as { system: Block[]; tools: Tool[]; messages: { role: string; content: Block[] }[] }
   const compaction = calls[0]!.body
-  expect(compaction.system).toEqual(sent.system)
+  expect(compaction.system.map((block) => block['text'])).toEqual(["You are Claude Code, Anthropic's official CLI for Claude.", SYSTEM])
+  expect(calls[0]!.headers['x-claude-code-session-id']).toBe('totalrecall-compaction')
   expect(compaction.tools).toBeUndefined()
   expect((compaction as unknown as { output_config: unknown }).output_config).toEqual({ effort: 'high' })
   expect(compaction.messages.length).toBe(1)
-  expect(compaction.messages[0]!.content.slice(0, 2)).toEqual(sent.messages[0]!.content.slice(0, 2))
-  expect(compaction.messages[0]!.content.slice(2).map((block) => String(block['text']).slice(0, 40))).toEqual(['<chat>\n</chat>', 'Compaction: compress message 0 into one ', '\n</input>'])
-  expectValidRoles(compaction.messages)
+  expect(compaction.messages[0]!.content.map((block) => String(block['text']).slice(0, 40))).toEqual(['<chat>\n</chat>', 'Compaction: compress message 0 into one ', '\n</input>'])
+  expect(chat.text({ l: 0, i: 0 })).toBe('user: an old long question')
 })
 
 test('a picture in a tool result is kept with its message, and its summary is written from the picture', async () => {

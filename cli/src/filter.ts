@@ -98,15 +98,6 @@ export class Filter {
       return this.passing.has(history) ? {} : { body: this.rewrite(request, this.turnViews.get(history) ?? this.chat.rendered(), isMain, device) }
     }
     if (path !== MESSAGES) return {}
-    if (isMain) {
-      const instructions = instructionsOf(request.messages)
-      this.compactor.useTemplate({
-        headers,
-        system: withPrompt(request.system, SYSTEM),
-        instructions: instructions.length === 0 ? [] : [{ role: 'user', content: instructions }],
-        metadata: request.metadata,
-      })
-    }
     const view = await this.ingest(history, isMain, device, request.messages)
     this.pending.set(id, { history, isMain, device, reply: new Accumulator() })
     return view === undefined ? {} : { body: this.rewrite(request, view, isMain, device) }
