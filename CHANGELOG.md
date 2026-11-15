@@ -4,6 +4,15 @@ What changed in each version of totalrecall, for the people who use it. cmod pub
 
 ## [Unreleased]
 
+## [0.2.2]
+
+### Changed
+- A recall turn reads one memory, the chat. Claude Code's auto memory stays out of it: its MEMORY.md index leaves your instructions, and its instructions to save memory files leave the system prompt. Sessions without recall keep auto memory as it is.
+
+### Fixed
+- Summaries read 95% of their input from the cache, up from 87% during an import, and write a fifth as much to it: each one reads the whole summary view, and its task is never written to the cache.
+- A subagent's recall requests keep the five-minute cache Claude Code gives them, instead of an hour's, which costs more to write.
+
 ## [0.2.1]
 
 ### Fixed
