@@ -3,7 +3,7 @@ import type { Compactor } from './compactor.ts'
 import { blocksOf, isCompaction, isContext, itemsOf, turnStart, type ApiMessage, type Item } from './history.ts'
 import { Accumulator, type Block, type StreamEvent } from './pool.ts'
 import { SUBAGENT, SYSTEM } from './prompt.ts'
-import { chatBlocks, mark, type Place } from './render.ts'
+import { CACHE, chatBlocks, mark, markedEnd, unmarked, type CacheMark, type Place } from './render.ts'
 import type { Sessions } from './sessions.ts'
 
 export const PLUGIN = 'totalrecall'
@@ -22,11 +22,6 @@ type Body = { system?: string | Block[]; tools?: Tool[]; messages?: ApiMessage[]
 type Pending = { readonly history: string; readonly isMain: boolean; readonly device: string; readonly reply: Accumulator }
 type Span = { readonly from: number; readonly to: number }
 
-const unmarked = (block: Block): Block => {
-  const { cache_control: _dropped, ...rest } = block
-  return rest
-}
-
 const isOwn = (tool: unknown): boolean => tool === OWN_TOOLS.zoom || tool === OWN_TOOLS.date
 
 const isOwnAddition = (block: Block): boolean => {
@@ -35,8 +30,16 @@ const isOwnAddition = (block: Block): boolean => {
   return isOwn(tool?.definition?.['name'] ?? tool?.name)
 }
 
+const AUTO_MEMORY = [
+  /\n# Memory\n\n[^\n]*`[^`\n]*\/memory\/`[\s\S]*?(?=\n# |(?![\s\S]))/,
+  /\n\nContents of [^\n]* \(user's auto-memory, persists across conversations\):\n[\s\S]*?(?=\n\nContents of |\n<\/system-reminder>|(?![\s\S]))/,
+]
+
+const withoutAutoMemory = (block: Block): Block =>
+  block.type === 'text' ? { ...block, text: AUTO_MEMORY.reduce((text, part) => text.replace(part, ''), String(block['text'])) } : block
+
 const withPrompt = (system: string | Block[] | undefined, prompt: string): Block[] => {
-  const blocks = (typeof system === 'string' ? [{ type: 'text', text: system }] : (system ?? [])).map(unmarked)
+  const blocks = (typeof system === 'string' ? [{ type: 'text', text: system }] : (system ?? [])).map(unmarked).map(withoutAutoMemory)
   const opening = blocks.findIndex((block) => /^You are (Claude Code|a Claude agent)/.test(String(block['text'] ?? '')))
   const at = opening !== -1 ? opening + 1 : blocks.findIndex((block) => String(block['text'] ?? '').startsWith('x-anthropic-billing-header')) + 1
   return [...blocks.slice(0, at), { type: 'text', text: prompt }, ...blocks.slice(at)]
@@ -52,10 +55,15 @@ const loadedTools = (block: Block): Block[] => {
 
 const instructionsOf = (messages: readonly ApiMessage[]): Block[] => {
   const preamble = messages[1]?.role === 'system' ? blocksOf(messages[1]!) : []
-  return [...blocksOf(messages[0]!).filter(isContext), ...preamble.filter((block) => !STATE_BLOCKS.has(block.type))]
+  return [...blocksOf(messages[0]!).filter(isContext).map(withoutAutoMemory), ...preamble.filter((block) => !STATE_BLOCKS.has(block.type))]
 }
 
 const toolsOf = (request: Body): Tool[] => request.tools!.map(({ cache_control: _dropped, ...tool }) => tool as Tool)
+
+const cacheOf = (request: Body): CacheMark => {
+  const blocks = [...(typeof request.system === 'string' ? [] : (request.system ?? [])), ...(request.messages ?? []).flatMap(blocksOf)]
+  return (blocks.find((block) => block['cache_control'] !== undefined)?.['cache_control'] as CacheMark | undefined) ?? CACHE
+}
 
 const joined = (messages: ApiMessage[]): ApiMessage[] => {
   const out: { role: string; content: Block[] }[] = []
@@ -233,6 +241,8 @@ export class Filter {
       if (previous.role === message.role && message.role !== 'assistant') previous.content.push(...blocksOf(message))
       else out.push({ role: message.role, content: [...blocksOf(message)] })
     }
-    return { ...request, system: withPrompt(request.system, isMain ? SYSTEM : SUBAGENT), tools: toolsOf(request), messages: mark(out, places) }
+    places.push({ message: out.length - 1, block: out.at(-1)!.content.length - 1 })
+    const cache = cacheOf(request)
+    return { ...request, system: markedEnd(withPrompt(request.system, isMain ? SYSTEM : SUBAGENT), cache), tools: toolsOf(request), messages: mark(out, places, cache) }
   }
 }

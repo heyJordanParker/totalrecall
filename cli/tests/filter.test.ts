@@ -109,6 +109,36 @@ test('a turn reads the system prompt and the person’s instructions, then the v
   expect(chat.message(0)).toMatchObject({ i: 0, kind: 'user', text: 'say hi' })
 })
 
+test('a turn reads none of auto memory: no MEMORY.md among the instructions, no memory section in the system prompt', async () => {
+  const { filter } = setup()
+  const guidance = '\nYou are an interactive agent that helps users.\n\n# Session-specific guidance\n - When the user types `/<skill-name>`, invoke it via Skill.\n'
+  const environment = '\n# Environment\n - The most recent Claude models are the Claude 5 family.'
+  const memory = [
+    '\n# Memory',
+    '',
+    'You have a persistent file-based memory at `/Users/jordan/.claude/projects/-work/memory/`. This directory already exists, so write to it directly with the Write tool.',
+    '',
+    '```markdown',
+    '---',
+    'name: <short-kebab-case-slug>',
+    '---',
+    '```',
+    '',
+    'After writing the file, add a one-line pointer in `MEMORY.md` (`- [Title](file.md): hook`).',
+    '',
+  ].join('\n')
+  const system = [SYSTEM_BLOCKS[0]!, SYSTEM_BLOCKS[1]!, { type: 'text', text: guidance + memory + environment, cache_control: MARK }]
+  const claudeMd = 'Contents of /Users/jordan/.claude/CLAUDE.md (user\'s private global instructions for all projects):\n\n# WHY\n\nThe business.\n\n# Memory\n\nThe person\'s own section about memory.'
+  const memoryMd = 'Contents of /Users/jordan/.claude/projects/-work/memory/MEMORY.md (user\'s auto-memory, persists across conversations):\n\n- [User database](user-database.md): MySQL 8, singular table names'
+  const rules = 'Contents of /Users/jordan/.claude/rules/code.md (user\'s private global instructions for all projects):\n\n### Write no comments'
+  const reminder = (files: string[]) => ({ type: 'text', text: `<system-reminder>\nCodebase and user instructions are shown below.\n\n${files.join('\n\n')}\n</system-reminder>` })
+  const opening = { role: 'user', content: [reminder([claudeMd, memoryMd, rules]), { type: 'text', text: 'say hi' }] }
+  const answer = await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: { ...body([opening]), system } })
+  const sent = answer.body as { system: Block[]; messages: { content: Block[] }[] }
+  expect(sent.system.map((block) => block['text'])).toEqual([SYSTEM_BLOCKS[0]!['text'], SYSTEM_BLOCKS[1]!['text'], SYSTEM, guidance + environment])
+  expect(sent.messages[0]!.content[0]!['text']).toBe(reminder([claudeMd, rules])['text'])
+})
+
 test('the next turn reads the earlier turn as summary lines, never whole', async () => {
   const { filter, chat } = setup()
   await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: HEADERS, body: body([OPENING, SESSION_START]) })
@@ -423,7 +453,8 @@ test('a line over 512 bytes is asked for again with only a note added, never the
   expect(retry.map((message) => message.role)).toEqual(['user'])
   expect(retry[0]!.content.slice(0, -1).map((block) => block['text'])).toEqual(first[0]!.content.map((block) => block['text']))
   expect(String(retry[0]!.content.at(-1)!['text'])).toStartWith('Too long: your last line for this <input> was 600 bytes,')
-  expect(marks(retry)).toBe(1)
+  expect(marks(retry)).toBe(0)
+  expect(marks(calls[1]!.body.system)).toBe(1)
   expect(chat.text({ l: 0, i: 0 })).toBe('user: short enough')
 })
 
@@ -495,6 +526,17 @@ test('a subagent reads the subagent prompt, not the main agent’s', async () =>
   const system = (answer.body as { system: Block[] }).system.map((block) => block['text'])
   expect(system).toContain(SUBAGENT)
   expect(system).not.toContain(SYSTEM)
+})
+
+test('a request keeps the cache time Claude Code gave it, on the system prompt’s end and every mark after', async () => {
+  const { filter } = setup()
+  const fiveMinutes = { type: 'ephemeral' }
+  const task = { role: 'user', content: [{ type: 'text', text: 'Find the config file.', cache_control: fiveMinutes }] }
+  const system = SYSTEM_BLOCKS.map((block) => (block.cache_control === undefined ? block : { ...block, cache_control: fiveMinutes }))
+  const answer = await filter.request(DEVICE, { id: 'r1', path: '/v1/messages', headers: { ...HEADERS, 'x-claude-code-agent-id': 'a1' }, body: { ...body([task]), system } })
+  const sent = answer.body as { system: Block[]; messages: { content: Block[] }[] }
+  expect(sent.system.map((block) => block['cache_control'])).toEqual([undefined, undefined, undefined, fiveMinutes])
+  expect(sent.messages.flatMap((message) => message.content).flatMap((block) => (block['cache_control'] === undefined ? [] : [block['cache_control']]))).toEqual([fiveMinutes])
 })
 
 test('a rewound history logs what follows the rewind, and keeps what came before', async () => {

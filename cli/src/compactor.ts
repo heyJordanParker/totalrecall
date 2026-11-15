@@ -2,17 +2,20 @@ import { LINE_BYTES, type Chat, type ChatEvents } from './chat.ts'
 import { imageBlock } from './history.ts'
 import { PoolError, textOf, type Block, type Pool, type Reply } from './pool.ts'
 import { compressTask, headBytes, mergeTask, SYSTEM, tooLong } from './prompt.ts'
-import { chatBlocks, mark, type Place } from './render.ts'
-import { children, COMPACTION, end, first, flat, name, render, slot, type Line } from './view.ts'
+import { CACHE, chatBlocks, mark, markedEnd, type Place } from './render.ts'
+import { children, end, first, flat, name, render, slot, type Line } from './view.ts'
 
 export const COMPACTION_MODEL = 'claude-haiku-5-5'
 export const AT_ONCE = 64
 const TRIES = 5
 const LONGEST_WAIT_MS = 60_000
-const COMPACTION_SYSTEM: readonly Block[] = [
-  { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
-  { type: 'text', text: SYSTEM },
-]
+const COMPACTION_SYSTEM: readonly Block[] = markedEnd(
+  [
+    { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+    { type: 'text', text: SYSTEM },
+  ],
+  CACHE,
+)
 
 type Side = 0 | 1
 type Waiter = { readonly before: number; readonly resolve: () => void }
@@ -126,11 +129,7 @@ export class Compactor implements ChatEvents {
 
   private context(line: Line): Line[] {
     const upto = Math.min(ctx(line), this.chat.unbuiltAt(this.chat.lineSide(line), 0))
-    const lines = this.chat.compactionView.lines.filter((each) => end(each) <= upto && this.chat.isBuilt(each))
-    let size = 0
-    let from = lines.length
-    while (from > 0 && size + this.chat.size(lines[from - 1]!) <= COMPACTION.high) size += this.chat.size(lines[--from]!)
-    return lines.slice(from)
+    return this.chat.compactionView.lines.filter((each) => end(each) <= upto && this.chat.isBuilt(each))
   }
 
   private task(line: Line, source: string): Block[] {
@@ -157,7 +156,7 @@ export class Compactor implements ChatEvents {
         system: COMPACTION_SYSTEM,
         thinking: { type: 'adaptive' },
         output_config: { effort: 'high' },
-        messages: mark([{ role: 'user', content: [...content, ...note] }], places),
+        messages: mark([{ role: 'user', content: [...content, ...note] }], places, CACHE),
       }
       const reply = await this.patiently(line, () => this.whileWriting(prefix, (started) => this.pool.complete(body, headers, started)))
       const isWhole = reply !== undefined && (reply.stopReason === 'end_turn' || reply.stopReason === 'stop_sequence')

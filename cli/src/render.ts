@@ -1,6 +1,8 @@
 import type { Block } from './pool.ts'
 
-export const CACHE = { type: 'ephemeral', ttl: '1h' } as const
+export type CacheMark = { readonly type: 'ephemeral'; readonly ttl?: '5m' | '1h' }
+
+export const CACHE: CacheMark = { type: 'ephemeral' }
 
 export type ChatBlocks = { readonly blocks: Block[]; readonly marked: number }
 
@@ -15,19 +17,20 @@ export const chatBlocks = (lines: readonly string[]): ChatBlocks => {
   return { blocks, marked: whole - 1 }
 }
 
-const unmarked = (block: Block): Block => {
+export const unmarked = (block: Block): Block => {
   const { cache_control: _dropped, ...rest } = block
   return rest
 }
 
+export const markedEnd = (blocks: readonly Block[], cache: CacheMark): Block[] => blocks.map((block, k) => (k === blocks.length - 1 ? { ...unmarked(block), cache_control: cache } : unmarked(block)))
+
 export type Place = { readonly message: number; readonly block: number }
 
-export const mark = <M extends { role: string; content: Block[] }>(messages: readonly M[], places: readonly Place[]): M[] => {
+export const mark = <M extends { role: string; content: Block[] }>(messages: readonly M[], places: readonly Place[], cache: CacheMark): M[] => {
   const marked = messages.map((message) => ({ ...message, content: message.content.map(unmarked) }))
-  const last = marked.length - 1
-  for (const { message, block } of [...places, { message: last, block: (marked[last]?.content.length ?? 0) - 1 }]) {
+  for (const { message, block } of places) {
     const content = marked[message]?.content
-    if (content?.[block] !== undefined) content[block] = { ...content[block], cache_control: CACHE }
+    if (content?.[block] !== undefined) content[block] = { ...content[block], cache_control: cache }
   }
   return marked
 }
