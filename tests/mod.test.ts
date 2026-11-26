@@ -1,15 +1,17 @@
 import { expect, test } from 'bun:test'
 import { Prompt } from '../node_modules/@cmodjs/core/mod.js'
 import { testMod } from '../node_modules/@cmodjs/core/testing.js'
+import { claudeCodeOf } from '../node_modules/@cmodjs/core/testing/claude-code.js'
 import { totalrecall } from '../src/mod.js'
 
 const VIEW = '<chat>\n0+1|user: hello\n</chat>'
 
-const setup = (options: { pool?: string; isServing?: boolean } = {}) => {
+const setup = (options: { pool?: string; isServing?: boolean; agents?: string[] } = {}) => {
   const filters: { method: string; input: object }[] = []
   const posted: string[] = []
   const ran: string[] = []
   const tested = testMod(totalrecall, {
+    ...(options.agents === undefined ? {} : { options: { agents: options.agents } }),
     dependencies: {
       oneclaude: {
         addFilter: async (input: object) => void filters.push({ method: 'addFilter', input }),
@@ -18,7 +20,13 @@ const setup = (options: { pool?: string; isServing?: boolean } = {}) => {
     },
   })
   tested.fakes.settings.read = (async () => (options.pool === undefined ? {} : { env: { ANTHROPIC_BASE_URL: options.pool } })) as never
-  tested.fakes.process.run = async () => ({ exitCode: 0, stdout: 'mac-studio\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
+  tested.fakes.device.read = async () => ({ id: '3043f03e21e649498c090b10de6b410d', name: 'mac-studio', os: 'darwin', arch: 'arm64' })
+  tested.fakes.process.spawn = (() => {
+    const output = (async function* () {
+      yield { stream: 'stdout', text: 'held\n' }
+    })()
+    return Object.assign(output, { result: Promise.resolve({ code: 0, signal: null }) })
+  }) as never
   tested.fakes.command.run = (async ({ command }: { command: string }) => {
     ran.push(command)
     return {}
@@ -64,6 +72,29 @@ test('turning it off mid-session keeps the filter only to take its tools out', a
   await tested.type('/recall')
   expect(await tested.type('/recall')).toMatchObject({ text: 'Total recall is off in this session.' })
   expect(filters.at(-1)).toEqual({ method: 'addFilter', input: { name: 'totalrecall', url: 'http://127.0.0.1:8320/strip', timeoutSeconds: 120, failOpen: true } })
+})
+
+test('a session that runs a listed agent starts with total recall on', async () => {
+  const { tested, filters } = setup({ agents: ['orchestrator'] })
+  await claudeCodeOf(tested).fire('SessionStart', { source: 'startup', agent_type: 'orchestrator' })
+  await tested.settle()
+  expect(tested.state.session.isOn).toBe(true)
+  expect((filters.at(-1)!.input as { url: string }).url).toStartWith('http://127.0.0.1:8320/on?device=mac-studio%3A%2F')
+})
+
+test('a listed agent’s session comes back with total recall on when another computer resumes it', async () => {
+  const { tested } = setup({ agents: ['orchestrator'] })
+  await claudeCodeOf(tested).fire('SessionStart', { source: 'resume', agent_type: 'orchestrator' })
+  await tested.settle()
+  expect(tested.state.session.isOn).toBe(true)
+})
+
+test('a session that runs an agent nobody listed starts with total recall off', async () => {
+  const { tested, filters } = setup({ agents: ['orchestrator'] })
+  await claudeCodeOf(tested).fire('SessionStart', { source: 'startup', agent_type: 'Explore' })
+  await tested.settle()
+  expect(tested.state.session.isOn).toBe(false)
+  expect(filters.map(({ method }) => method)).toEqual(['removeFilter'])
 })
 
 test('a session that never turned it on stays out of the filter', async () => {
