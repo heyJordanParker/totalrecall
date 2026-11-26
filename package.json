@@ -7,10 +7,9 @@
   },
   "cmod": {
     "program": "totalrecall",
-    "install": "./setup/install.sh",
-    "uninstall": "./setup/uninstall.sh"
+    "install": "./setup/install.sh"
   },
   "dependencies": {
-    "@cmodjs/core": "^6.0.2"
+    "@cmodjs/core": "^8.10.4"
   }
 }

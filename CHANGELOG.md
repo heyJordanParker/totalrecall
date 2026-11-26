@@ -4,6 +4,15 @@ What changed in each version of totalrecall, for the people who use it. cmod pub
 
 ## [Unreleased]
 
+## [0.3.0]
+
+### Added
+- The `agents` option turns recall on by itself in every session that runs one of the agents it lists, as `claude --agent` starts one, so an orchestrator started in the background or on another computer has its memory without `/recall`.
+
+### Changed
+- cmod runs the chat's program as a service of each computer, and it serves the chat only on the computer the pool runs on. The service totalrecall installed itself goes away on update.
+- totalrecall runs on cmod 8 and names each computer as cmod does.
+
 ## [0.2.2]
 
 ### Changed

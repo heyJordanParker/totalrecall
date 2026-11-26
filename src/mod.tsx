@@ -1,6 +1,8 @@
-import { commands, defineMod, http, process, sessions, settings } from '../node_modules/@cmodjs/core/mod.js'
+import { commands, defineMod, device, http, sessions, settings } from '../node_modules/@cmodjs/core/mod.js'
+import { program } from '../node_modules/@cmodjs/core/jobs/program.js'
 import { slashCommand } from '../node_modules/@cmodjs/core/jobs/slash-command.js'
 import { tool } from '../node_modules/@cmodjs/core/jobs/tool.js'
+import { option } from '../node_modules/@cmodjs/core/options.js'
 import { initialState } from './state.js'
 
 const NAME = 'totalrecall'
@@ -24,18 +26,23 @@ const keptTokens = async (): Promise<number> => {
 export const totalrecall = defineMod({
   name: NAME,
   state: initialState,
+  options: {
+    agents: option.list({ title: 'Agents with recall', description: 'Recall turns on by itself in every session that runs one of these agents, as claude --agent starts one', default: [] }),
+  },
 
   setup(mod) {
+    mod.use(program({ command: ['totalrecall', 'serve'], isService: true }))
+
     const post = async (path: string, input: object): Promise<unknown> => {
       const response = await http.fetch(`http://${await poolHost()}:${PORT}${path}`, { method: 'POST', body: JSON.stringify(input) })
       if (response.status !== 200) throw new Error(`${NAME}: the program answered ${response.status}: ${response.text}`)
       return JSON.parse(response.text)
     }
 
-    let device: string | undefined
+    let computer: string | undefined
     const deviceOf = async (): Promise<string> => {
-      device ??= (await process.run(['hostname'])).stdout.trim()
-      return `${device}:${sessions.current.cwd}`
+      computer ??= (await device.read()).name
+      return `${computer}:${sessions.current.cwd}`
     }
 
     const addTools = (): void => {
@@ -113,6 +120,13 @@ export const totalrecall = defineMod({
         },
       }),
     )
+
+    sessions.current.onSessionStart(async () => {
+      const agent = sessions.current.agentType
+      if (agent === undefined || !mod.options.agents.includes(agent) || mod.state.session.isOn) return
+      await sync(true)
+      mod.state.session.isOn = true
+    })
 
     sync(mod.state.session.isOn).catch((error: unknown) => mod.log(`could not add the filter at start: ${String(error)}`))
   },

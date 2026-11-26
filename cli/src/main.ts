@@ -8,7 +8,7 @@ import { imageBlock } from './history.ts'
 import { Imports, runImport, type Imported } from './import.ts'
 import { Pool, type Block } from './pool.ts'
 import { chatBlocks } from './render.ts'
-import { install, PORT, poolAddresses, poolUrl, remove } from './service.ts'
+import { PORT, poolAddresses, poolUrl } from './service.ts'
 import { Sessions } from './sessions.ts'
 import { children, render } from './view.ts'
 import plugin from '../../.claude-plugin/plugin.json' with { type: 'json' }
@@ -92,7 +92,19 @@ const notJson = (request: Request): Response => {
   return new Response('The body must be JSON.', { status: 400 })
 }
 
+const POOL_CHECK_MS = 60_000
+
+const isPoolHere = (): Promise<boolean> =>
+  poolAddresses().then(
+    ({ isHere }) => isHere,
+    (error: unknown) => {
+      console.error(`totalrecall: could not find the pool at ${poolUrl()}: ${error instanceof Error ? error.message : String(error)}`)
+      return false
+    },
+  )
+
 const serve = async (folder: string): Promise<void> => {
+  while (!(await isPoolHere())) await Bun.sleep(POOL_CHECK_MS)
   mkdirSync(folder, { recursive: true })
   lock(folder)
   const chat = new Chat(folder)
@@ -137,7 +149,8 @@ const serve = async (folder: string): Promise<void> => {
       error,
     })
   }
-  console.log(`totalrecall serves the chat in ${folder} on port ${PORT}, beside the pool at ${poolUrl()}.`)
+  console.log(`127.0.0.1:${PORT}`)
+  console.error(`totalrecall serves the chat in ${folder} on port ${PORT}, beside the pool at ${poolUrl()}.`)
 }
 
 const isLoopback = (address: string): boolean => address === '::1' || address.startsWith('127.')
@@ -153,15 +166,13 @@ const program = (path: string, body: object): Promise<unknown> => {
 
 const [command, argument] = process.argv.slice(2)
 if (command === '--version') console.log(VERSION)
-else if (command === 'serve' && argument !== undefined) await serve(argument)
-else if (command === 'service' && argument === 'install' && process.argv[4] !== undefined) await install(process.argv[4])
-else if (command === 'service' && argument === 'remove') remove()
+else if (command === 'serve' && argument === undefined && process.env['CMOD_DATA'] !== undefined) await serve(process.env['CMOD_DATA'])
 else if (command === 'import') {
   await runImport(process.argv.slice(3), program, (line) => console.log(line), AT_ONCE).catch((error: unknown) => {
     console.error(`totalrecall import: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(1)
   })
 } else {
-  console.error('Usage: totalrecall serve <data folder> | totalrecall service install <data folder> | totalrecall service remove | totalrecall import [since <YYYY-MM-DD>] [tools] [<export>…] [go]')
+  console.error('Usage: totalrecall serve, which cmod runs with CMOD_DATA | totalrecall import [since <YYYY-MM-DD>] [tools] [<export>…] [go]')
   process.exit(2)
 }
