@@ -10,8 +10,8 @@
       "description": "Claude remembers everything: every session you turn it on in shares one chat that never ends.",
       "source": {
         "source": "archive",
-        "url": "https://github.com/heyJordanParker/totalrecall/releases/download/v0.2.2/totalrecall-0.2.2.zip",
-        "sha256": "4bd82dcea7ca2113c3ebcf1bc0e0398c7a8b07d9eada5ecc214935ec7070d909"
+        "url": "https://github.com/heyJordanParker/totalrecall/releases/download/v0.3.0/totalrecall-0.3.0.zip",
+        "sha256": "918f297884bd2f574bc3a4789bec26d9057b5f2e3a320def55978ba2efae053b"
       }
     },
     {
